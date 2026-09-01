@@ -1,0 +1,110 @@
+# Example: "createOrder" tool — 4 stages mixing sequential and parallel calls.
+#
+# Latency profile (assume each call ~200ms):
+#
+#   Stage 1 (sequential)  authenticate              200ms
+#   Stage 2 (parallel)    customerProfile+inventory 200ms  ← fired together
+#   Stage 3 (sequential)  riskCheck                 200ms  ← uses both stage-2 outputs
+#   Stage 4 (sequential)  createOrder               200ms
+#                                                   ------
+#                         Total                     800ms  (vs 1000ms all-sequential)
+
+toolName: createOrder
+toolDescription: >
+  Creates an order by authenticating, enriching customer and inventory
+  data in parallel, running a risk check, then creating the order record.
+  Returns the new order ID and status.
+
+toolInputSchema: |
+  {
+    "type": "object",
+    "properties": {
+      "customerId": { "type": "string" },
+      "productSku":  { "type": "string" },
+      "quantity":    { "type": "integer", "minimum": 1 }
+    },
+    "required": ["customerId", "productSku", "quantity"]
+  }
+
+mcpEndpoint: /mcp
+strictMode: true
+perRequestTimeoutMs: 15000
+
+# inputTransform: normalize and upper-case the customer ID before the pipeline.
+inputTransform: "#[{customerId: payload.customerId upper, productSku: payload.productSku, quantity: payload.quantity}]"
+
+# outputTransform: return only the fields the agent needs.
+outputTransform: "#[{orderId: payload.createOrder.data.id, status: payload.createOrder.status, riskApproved: payload.riskCheck}]"
+
+stages:
+  # ── Stage 1: sequential ─────────────────────────────────────────────────────
+  - calls:
+      - name: authenticate
+        endpoint: https://auth.internal/api
+        method: POST
+        path: /token
+        authType: basicAuth
+        username: svc-composer
+        password: "${env.AUTH_PASSWORD}"
+        bodyTemplate: '{"clientId":"${args.customerId}","scope":"orders"}'
+        stopOnError: true
+        outputExtract: access_token   # ${steps.authenticate} = the token string
+
+  # ── Stage 2: parallel ───────────────────────────────────────────────────────
+  - parallel: true
+    calls:
+      - name: customerProfile
+        endpoint: https://crm.internal/api
+        method: GET
+        path: /customers/${args.customerId}
+        authType: bearerToken
+        token: "${steps.authenticate}"   # ← now correctly resolved via expr::interpolate
+        stopOnError: true
+        outputExtract: data
+
+      - name: inventoryCheck
+        endpoint: https://wms.internal/api
+        method: GET
+        path: /inventory/${args.productSku}
+        authType: apiKeyHeader
+        headerName: x-api-key
+        apiKey: "${env.WMS_API_KEY}"
+        stopOnError: false               # low-stock warning, not fatal
+        outputExtract: available
+
+  # ── Stage 3: sequential ─────────────────────────────────────────────────────
+  - calls:
+      - name: riskCheck
+        endpoint: https://risk.internal/api
+        method: POST
+        path: /evaluate
+        authType: bearerToken
+        token: "${steps.authenticate}"
+        bodyTemplate: |
+          {
+            "customerId":   "${args.customerId}",
+            "customerTier": "${steps.customerProfile.tier}",
+            "sku":          "${args.productSku}",
+            "quantity":     ${args.quantity},
+            "stockLevel":   ${steps.inventoryCheck}
+          }
+        stopOnError: true
+        outputExtract: approved
+
+  # ── Stage 4: sequential ─────────────────────────────────────────────────────
+  - calls:
+      - name: createOrder
+        endpoint: https://oms.internal/api
+        method: POST
+        path: /orders
+        authType: bearerToken
+        token: "${steps.authenticate}"
+        bodyTemplate: |
+          {
+            "customerId":   "${args.customerId}",
+            "customerTier": "${steps.customerProfile.tier}",
+            "sku":          "${args.productSku}",
+            "quantity":     ${args.quantity},
+            "riskApproved": ${steps.riskCheck}
+          }
+        stopOnError: true

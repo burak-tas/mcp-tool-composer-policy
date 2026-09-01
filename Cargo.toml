@@ -1,0 +1,32 @@
+# Copyright 2026 Salesforce, Inc. All rights reserved.
+[package]
+name = "mcp_tool_composer"
+version = "0.1.0"
+rust-version = "1.88.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[package.metadata.anypoint]
+group_id = "96a7526c-e657-42de-919e-0b7bdfab7a80"
+definition_asset_id = "mcp-tool-composer-policy"
+implementation_asset_id = "mcp-tool-composer-policy-impl"
+
+[dependencies]
+pdk = "1.10.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc", "preserve_order"] }
+anyhow = "1.0"
+thiserror = "1"
+base64 = "0.22"
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+pdk-unit = "1.10.0"
+
+[profile.release]
+lto = true
+opt-level = 'z'
+strip = "debuginfo"
+panic = "abort"

@@ -1,0 +1,75 @@
+# Example: getWeatherReport — public Open-Meteo APIs, no API key required.
+# Good for local playground testing.
+#
+# Pipeline latency (approx):
+#   Stage 1  geocode (sequential)                         ~120ms
+#   Stage 2  currentWeather + forecast + airQuality (parallel) ~200ms
+#                                                         ──────
+#   Total                                                 ~320ms (vs ~720ms sequential)
+
+toolName: getWeatherReport
+toolDescription: >
+  Returns a weather report for any city: current conditions, 7-day forecast,
+  and air quality index. Resolves the city name to coordinates first, then
+  fetches all three data sources in parallel.
+
+toolInputSchema: |
+  {
+    "type": "object",
+    "properties": {
+      "city": {
+        "type": "string",
+        "description": "City name, e.g. Istanbul, London, Tokyo"
+      }
+    },
+    "required": ["city"]
+  }
+
+mcpEndpoint: /mcp
+strictMode: true
+perRequestTimeoutMs: 10000
+
+# inputTransform: trim and title-case the city name before geocoding.
+inputTransform: "#[{city: payload.city trim}]"
+
+# outputTransform: return a clean summary instead of the raw composite output.
+outputTransform: "#[{city: payload.geocode.name, country: payload.geocode.country_code, tempC: payload.currentWeather.temperature_2m, humidity: payload.currentWeather.relative_humidity_2m, windKph: payload.currentWeather.wind_speed_10m, aqi: payload.airQuality.us_aqi, forecast: payload.forecast}]"
+
+stages:
+
+  # ── Stage 1: sequential ────────────────────────────────────────────────────
+  - calls:
+      - name: geocode
+        endpoint: https://geocoding-api.open-meteo.com
+        method: GET
+        path: /v1/search?name=${args.city}&count=1&language=en&format=json
+        authType: none
+        stopOnError: true
+        outputExtract: results.0
+
+  # ── Stage 2: parallel ──────────────────────────────────────────────────────
+  - parallel: true
+    calls:
+      - name: currentWeather
+        endpoint: https://api.open-meteo.com
+        method: GET
+        path: /v1/forecast?latitude=${steps.geocode.latitude}&longitude=${steps.geocode.longitude}&current=temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code&timezone=auto
+        authType: none
+        stopOnError: true
+        outputExtract: current
+
+      - name: forecast
+        endpoint: https://api.open-meteo.com
+        method: GET
+        path: /v1/forecast?latitude=${steps.geocode.latitude}&longitude=${steps.geocode.longitude}&daily=temperature_2m_max,temperature_2m_min,precipitation_sum&timezone=auto&forecast_days=7
+        authType: none
+        stopOnError: true
+        outputExtract: daily
+
+      - name: airQuality
+        endpoint: https://air-quality-api.open-meteo.com
+        method: GET
+        path: /v1/air-quality?latitude=${steps.geocode.latitude}&longitude=${steps.geocode.longitude}&current=us_aqi,pm10,pm2_5
+        authType: none
+        stopOnError: false   # degrades gracefully if AQ API is down
+        outputExtract: current

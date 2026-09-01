@@ -1,0 +1,11 @@
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: Logging
+metadata:
+  name: default
+spec:
+  outputs:
+    - name: stdout
+      type: Console
+  levels:
+    default: Debug

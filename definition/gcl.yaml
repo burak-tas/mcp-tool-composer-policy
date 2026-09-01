@@ -1,0 +1,254 @@
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: Extension
+metadata:
+  labels:
+    title: MCP Tool Composer Policy
+    description: Exposes a single MCP tool that executes a declarative pipeline of REST API calls in sequential and parallel stages, with DataWeave transforms and per-call auth.
+    category: MCP
+    metadata/interfaceScope: api,resource
+    metadata/capabilities/injectionPoint: inbound
+    metadata/capabilities/assetTypes: mcp
+spec:
+  extends:
+    - name: extension-definition
+      namespace: default
+  properties:
+    # ------------------------------------------------------------------
+    # MCP surface
+    # ------------------------------------------------------------------
+    mcpEndpoint:
+      type: string
+      default: /mcp
+      description: Path where the virtual MCP endpoint is served.
+
+    strictMode:
+      type: boolean
+      default: true
+      description: >
+        When true, non-MCP requests are rejected with 404.
+        When false, they fall through to the Flex Gateway upstream.
+
+    # ------------------------------------------------------------------
+    # The single exposed MCP tool
+    # ------------------------------------------------------------------
+    toolName:
+      type: string
+      description: >
+        Name of the MCP tool exposed to clients (e.g. "createOrder").
+        Must be a valid MCP tool name (no spaces).
+
+    toolDescription:
+      type: string
+      description: Human-readable description shown in tools/list responses.
+
+    toolInputSchema:
+      type: string
+      description: >
+        JSON Schema string describing the tool's input arguments.
+        Example: '{"type":"object","properties":{"customerId":{"type":"string"}},"required":["customerId"]}'
+
+    # ------------------------------------------------------------------
+    # DataWeave transforms
+    # Top-level placement is required — dw2pel only compiles dataweave
+    # at top-level or inside objects, NOT inside array items.
+    # ------------------------------------------------------------------
+    inputTransform:
+      type: string
+      format: dataweave
+      default: "#[payload]"
+      description: >
+        DataWeave expression applied to the incoming MCP tool arguments
+        before the pipeline runs. Result becomes ${args.*} inside stages.
+        Example: "#[{customerId: payload.id upper, amount: payload.qty * payload.unitPrice}]"
+      bindings:
+        payload:
+          mimeType: json
+
+    outputTransform:
+      type: string
+      format: dataweave
+      default: "#[payload]"
+      description: >
+        DataWeave expression applied to the composite pipeline output
+        (object keyed by call name) before returning the MCP tool result.
+        Example: "#[{orderId: payload.createOrder.data.id, status: payload.createOrder.status}]"
+      bindings:
+        payload:
+          mimeType: json
+
+    # ------------------------------------------------------------------
+    # Execution pipeline — ordered list of stages
+    # ------------------------------------------------------------------
+    stages:
+      type: array
+      description: >
+        Ordered list of execution stages. Stages run sequentially.
+        When parallel=true all calls in a stage are dispatched concurrently
+        and must not reference each other's outputs via ${steps.*}.
+        Maximum 10 stages, 5 calls per parallel stage, 10 calls total.
+      items:
+        type: object
+        properties:
+          parallel:
+            type: boolean
+            default: false
+            description: >
+              When true, all calls are dispatched before any result is
+              consumed. When false (default), exactly one call runs
+              serially after the previous stage completes.
+
+          calls:
+            type: array
+            description: REST API call definitions for this stage.
+            items:
+              type: object
+              properties:
+                name:
+                  type: string
+                  description: >
+                    Unique call identifier used in ${steps.<name>.*} expressions.
+
+                endpoint:
+                  type: string
+                  format: service
+                  description: >
+                    Base URL of the REST service. Registered as a Flex
+                    Gateway upstream service at policy init.
+
+                method:
+                  type: string
+                  enum:
+                    - GET
+                    - POST
+                    - PUT
+                    - PATCH
+                    - DELETE
+                  default: POST
+                  description: HTTP method for this call.
+
+                path:
+                  type: string
+                  default: /
+                  description: >
+                    URL path relative to endpoint.
+                    Supports ${args.*} and ${steps.<name>.*} expressions.
+
+                bodyTemplate:
+                  type: string
+                  description: >
+                    JSON body template. Supports ${args.*} / ${steps.*} expressions.
+                    Omit for GET/DELETE.
+
+                authType:
+                  type: string
+                  enum:
+                    - none
+                    - passthrough
+                    - bearerToken
+                    - basicAuth
+                    - apiKeyHeader
+                    - customHeaders
+                  default: none
+                  description: >
+                    Authentication strategy for this call.
+                    passthrough: forwards the Authorization header from the
+                    incoming MCP request unchanged — zero credential config.
+                    bearerToken/basicAuth/apiKeyHeader: static or ${steps.*}-resolved credentials.
+                    customHeaders: full control via the headers array.
+
+                token:
+                  type: string
+                  description: >
+                    Bearer token. Required when authType=bearerToken.
+                    Supports ${steps.*} expressions, e.g. "${steps.authCall}".
+                  "@context":
+                    "@characteristics":
+                      - "security:sensitive"
+
+                username:
+                  type: string
+                  description: Basic auth username. Required when authType=basicAuth.
+
+                password:
+                  type: string
+                  description: Basic auth password. Required when authType=basicAuth.
+                  "@context":
+                    "@characteristics":
+                      - "security:sensitive"
+
+                headerName:
+                  type: string
+                  description: >
+                    API key header name (e.g. x-api-key).
+                    Required when authType=apiKeyHeader.
+
+                apiKey:
+                  type: string
+                  description: API key value. Required when authType=apiKeyHeader.
+                  "@context":
+                    "@characteristics":
+                      - "security:sensitive"
+
+                headers:
+                  type: array
+                  description: >
+                    Extra HTTP headers. When authType=customHeaders these carry
+                    all auth materials. Values support ${...} expressions.
+                  items:
+                    type: object
+                    properties:
+                      name:
+                        type: string
+                        description: Header name.
+                      value:
+                        type: string
+                        description: Header value (supports ${...} expressions).
+                    required:
+                      - name
+                      - value
+
+                timeoutMs:
+                  type: integer
+                  minimum: 100
+                  maximum: 600000
+                  description: >
+                    Per-call timeout override (ms).
+                    Falls back to perRequestTimeoutMs when unset.
+
+                stopOnError:
+                  type: boolean
+                  default: true
+                  description: >
+                    When true, a non-2xx response aborts the pipeline and
+                    returns an MCP error. When false, this call's output is
+                    null and the pipeline continues.
+
+                outputExtract:
+                  type: string
+                  description: >
+                    Dot-notation path to extract from the response body.
+                    Example: "data.id" makes ${steps.<name>} = that value.
+                    When omitted, ${steps.<name>} is the full response body.
+
+              required:
+                - name
+                - endpoint
+
+        required:
+          - calls
+
+    # ------------------------------------------------------------------
+    # Global timing
+    # ------------------------------------------------------------------
+    perRequestTimeoutMs:
+      type: integer
+      minimum: 100
+      maximum: 600000
+      default: 30000
+      description: Default per-call timeout (ms). Overridable per call via timeoutMs.
+
+  required:
+    - toolName
+    - toolDescription
+    - stages

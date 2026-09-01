@@ -1,0 +1,5 @@
+target/
+*.wasm
+Cargo.lock
+playground/config/registration.yaml
+.DS_Store

@@ -1,0 +1,84 @@
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: ApiInstance
+metadata:
+  name: ingress-http
+spec:
+  address: http://0.0.0.0:8081
+  services:
+    upstream:
+      address: https://anypoint.mulesoft.com # dummy — never reached (policy handles all MCP methods via Flow::Break)
+      routes:
+        - config:
+            destinationPath: /
+  policies:
+    - policyRef:
+        name: mcp-tool-composer-policy-v0-1-impl
+        namespace: default
+      config:
+        mcpEndpoint: "/mcp"
+        strictMode: true
+        perRequestTimeoutMs: 10000
+
+        toolName: getWeatherMultiSource
+        toolDescription: >
+          Gibt das aktuelle Wetter für eine Stadt zurück, abgefragt von 3
+          unabhängigen Quellen gleichzeitig: Open-Meteo (Wetter & Wind),
+          Open-Meteo Air Quality (Luftqualität) und wttr.in (2. Wetterquelle).
+          Jedes Ergebnis enthält die Quellenangabe.
+        toolInputSchema: |
+          {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string",
+                "description": "Stadtname, z.B. Berlin, Istanbul, Tokyo"
+              }
+            },
+            "required": ["city"]
+          }
+
+
+        stages:
+
+          # ── Stage 1: Geocoding (sequenziell) ────────────────────────────────
+          # Wandelt Stadtname → lat/lon um, damit Stage 2 die Koordinaten nutzen kann.
+          - calls:
+              - name: geocode
+                endpoint: https://geocoding-api.open-meteo.com
+                method: GET
+                path: /v1/search?name=${args.city}&count=1&language=de&format=json
+                authType: none
+                stopOnError: true
+                outputExtract: results.0
+
+          # ── Stage 2: 3 Services parallel ────────────────────────────────────
+          # Alle 3 Calls werden gleichzeitig abgefeuert. Latenz = Max(3 Calls).
+          - parallel: true
+            calls:
+
+              # Quelle 1: Open-Meteo — Temperatur, Wind, Luftfeuchte
+              - name: weather
+                endpoint: https://api.open-meteo.com
+                method: GET
+                path: /v1/forecast?latitude=${steps.geocode.latitude}&longitude=${steps.geocode.longitude}&current=temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,weather_code&timezone=auto
+                authType: none
+                stopOnError: true
+                outputExtract: current
+
+              # Quelle 2: Open-Meteo Air Quality — Luftqualitätsindex
+              - name: airQuality
+                endpoint: https://air-quality-api.open-meteo.com
+                method: GET
+                path: /v1/air-quality?latitude=${steps.geocode.latitude}&longitude=${steps.geocode.longitude}&current=us_aqi,pm10,pm2_5
+                authType: none
+                stopOnError: false
+                outputExtract: current
+
+              # Quelle 3: wttr.in — unabhängige 2. Wetterquelle mit Textbeschreibung
+              - name: wttrWeather
+                endpoint: https://wttr.in
+                method: GET
+                path: /${args.city}?format=j1
+                authType: none
+                stopOnError: false
