@@ -183,6 +183,13 @@ spec:
                   description: >
                     Per-call timeout override (ms). Falls back to
                     perRequestTimeoutMs when unset.
+                maskInOutput:
+                  type: boolean
+                  default: false
+                  description: >
+                    When true, this call's value is replaced with "***" in the
+                    final MCP response. The value still flows through the pipeline
+                    normally so downstream ${steps.<name>} expressions resolve.
                 stopOnError:
                   type: boolean
                   default: true

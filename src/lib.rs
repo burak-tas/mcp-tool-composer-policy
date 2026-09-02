@@ -292,13 +292,15 @@ pub async fn configure(
     let policy = PolicyConfig::from_config(&raw)
         .map_err(|e| anyhow::anyhow!("policy configuration rejected: {e}"))?;
 
+    let masked: Vec<&str> = policy.all_calls().filter(|c| c.mask_in_output).map(|c| c.name.as_str()).collect();
     logger::info!(
-        "[{}] loaded '{}'; {} stage(s), {} call(s); endpoint='{}'",
+        "[{}] loaded '{}'; {} stage(s), {} call(s); endpoint='{}'; masked=[{}]",
         POLICY_NAME,
         policy.tool_name,
         policy.stages.len(),
         policy.all_calls().count(),
         policy.mcp_endpoint,
+        masked.join(", "),
     );
 
     // Build service map: call name → registered Flex Gateway Service handle.

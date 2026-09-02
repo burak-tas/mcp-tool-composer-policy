@@ -7,7 +7,7 @@ spec:
   address: http://0.0.0.0:8081
   services:
     upstream:
-      address: https://anypoint.mulesoft.com # dummy — never reached (policy handles all MCP methods via Flow::Break)
+      address: https://www.a2d-ai.com
       routes:
         - config:
             destinationPath: /
@@ -18,67 +18,70 @@ spec:
       config:
         mcpEndpoint: "/mcp"
         strictMode: true
-        perRequestTimeoutMs: 10000
+        perRequestTimeoutMs: 15000
 
-        toolName: getWeatherMultiSource
+        toolName: createOrder
         toolDescription: >
-          Gibt das aktuelle Wetter für eine Stadt zurück, abgefragt von 3
-          unabhängigen Quellen gleichzeitig: Open-Meteo (Wetter & Wind),
-          Open-Meteo Air Quality (Luftqualität) und wttr.in (2. Wetterquelle).
-          Jedes Ergebnis enthält die Quellenangabe.
+          Creates an order by first obtaining a bearer token from the auth
+          service, then fetching customer profile and inventory data in
+          parallel, and finally submitting the order. Returns orderId and
+          confirmed status.
         toolInputSchema: |
           {
             "type": "object",
             "properties": {
-              "city": {
-                "type": "string",
-                "description": "Stadtname, z.B. Berlin, Istanbul, Tokyo"
-              }
+              "customerId": { "type": "string", "description": "Customer ID, e.g. CUST-001" },
+              "productSku":  { "type": "string", "description": "Product SKU, e.g. SKU-7842" },
+              "quantity":    { "type": "integer", "minimum": 1 }
             },
-            "required": ["city"]
+            "required": ["customerId", "productSku", "quantity"]
           }
+
+        # inputTransform and outputTransform omitted — identity pass-through (no DW eval)
 
 
         stages:
 
-          # ── Stage 1: Geocoding (sequenziell) ────────────────────────────────
-          # Wandelt Stadtname → lat/lon um, damit Stage 2 die Koordinaten nutzen kann.
+          # ── Stage 1: Auth (sequential, no-auth API) ──────────────────────────
           - calls:
-              - name: geocode
-                endpoint: https://geocoding-api.open-meteo.com
-                method: GET
-                path: /v1/search?name=${args.city}&count=1&language=de&format=json
+              - name: getToken
+                endpoint: https://www.a2d-ai.com
+                method: POST
+                path: /api/platform/2992ab1d-933d-47db-b98a-50e3723c31e7/api/auth/token
                 authType: none
+                bodyTemplate: '{"client_id":"mcp-composer-client","client_secret":"demo-secret"}'
                 stopOnError: true
-                outputExtract: results.0
+                outputExtract: access_token
+                maskInOutput: true
 
-          # ── Stage 2: 3 Services parallel ────────────────────────────────────
-          # Alle 3 Calls werden gleichzeitig abgefeuert. Latenz = Max(3 Calls).
+          # ── Stage 2: Customer + Inventory in parallel ─────────────────────────
           - parallel: true
             calls:
-
-              # Quelle 1: Open-Meteo — Temperatur, Wind, Luftfeuchte
-              - name: weather
-                endpoint: https://api.open-meteo.com
+              - name: fetchCustomer
+                endpoint: https://www.a2d-ai.com
                 method: GET
-                path: /v1/forecast?latitude=${steps.geocode.latitude}&longitude=${steps.geocode.longitude}&current=temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,weather_code&timezone=auto
-                authType: none
+                path: /api/platform/6bb6994c-9dcf-41f6-a314-89e3af12e0d1/api/customers/customers/${args.customerId}
+                authType: bearerToken
+                token: "${steps.getToken}"
                 stopOnError: true
-                outputExtract: current
 
-              # Quelle 2: Open-Meteo Air Quality — Luftqualitätsindex
-              - name: airQuality
-                endpoint: https://air-quality-api.open-meteo.com
+              - name: checkInventory
+                endpoint: https://www.a2d-ai.com
                 method: GET
-                path: /v1/air-quality?latitude=${steps.geocode.latitude}&longitude=${steps.geocode.longitude}&current=us_aqi,pm10,pm2_5
-                authType: none
+                path: /api/platform/aed7c7a0-88c5-4700-bc86-c302ae789bb0/api/inventory/products/${args.productSku}
+                authType: apiKeyHeader
+                headerName: X-API-Key
+                apiKey: inv-api-key-mcp-composer-2026
                 stopOnError: false
-                outputExtract: current
 
-              # Quelle 3: wttr.in — unabhängige 2. Wetterquelle mit Textbeschreibung
-              - name: wttrWeather
-                endpoint: https://wttr.in
-                method: GET
-                path: /${args.city}?format=j1
-                authType: none
-                stopOnError: false
+          # ── Stage 3: Create order (sequential, Basic auth) ────────────────────
+          - calls:
+              - name: createOrder
+                endpoint: https://www.a2d-ai.com
+                method: POST
+                path: /api/platform/45f33fc3-a0d8-433b-895f-c0a578060c97/api/orders/orders
+                authType: basicAuth
+                username: orders-svc
+                password: "s3cr3t-mcp-2026"
+                bodyTemplate: '{"customerId":"${args.customerId}","sku":"${args.productSku}","quantity":${args.quantity}}'
+                stopOnError: true

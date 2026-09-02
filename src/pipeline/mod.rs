@@ -139,8 +139,25 @@ pub async fn run_pipeline(
         }
     }
 
-    let final_output =
-        Value::Object(step_outputs.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+    // Build final output, replacing masked call values with "***".
+    let masked_names: std::collections::HashSet<&str> = config
+        .all_calls()
+        .filter(|c| c.mask_in_output)
+        .map(|c| c.name.as_str())
+        .collect();
+
+    let final_output = Value::Object(
+        step_outputs
+            .iter()
+            .map(|(k, v)| {
+                if masked_names.contains(k.as_str()) {
+                    (k.clone(), Value::String("***".into()))
+                } else {
+                    (k.clone(), v.clone())
+                }
+            })
+            .collect(),
+    );
 
     Ok(PipelineResult { final_output })
 }

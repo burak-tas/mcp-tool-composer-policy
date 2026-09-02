@@ -166,6 +166,7 @@ pub struct CallDef {
     pub timeout_ms: Option<u32>,
     pub stop_on_error: bool,
     pub output_extract: Option<String>,
+    pub mask_in_output: bool,
 }
 
 /// A stage is either one sequential call or a group of parallel calls.
@@ -347,6 +348,7 @@ fn parse_calls(
             timeout_ms,
             stop_on_error: raw_call.stop_on_error.unwrap_or(true),
             output_extract: raw_call.output_extract.clone(),
+            mask_in_output: raw_call.mask_in_output.unwrap_or(false),
         });
     }
     Ok(defs)

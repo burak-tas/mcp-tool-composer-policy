@@ -20,6 +20,8 @@ pub struct Calls0Config {
     pub header_name: Option<String>,
     #[serde(alias = "headers")]
     pub headers: Option<Vec<Headers0Config>>,
+    #[serde(alias = "maskInOutput")]
+    pub mask_in_output: Option<bool>,
     #[serde(alias = "method")]
     pub method: Option<String>,
     #[serde(alias = "name")]
