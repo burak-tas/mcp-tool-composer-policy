@@ -1,6 +1,6 @@
 # MCP Tool Composer Policy
 
-A [Flex Gateway PDK](https://docs.mulesoft.com/gateway/latest/policies-pdk-overview) custom policy that exposes a single **MCP tool** backed by a declarative pipeline of REST API calls — with sequential and parallel stages, DataWeave transforms, and per-call authentication.
+A [Omni Gateway PDK](https://docs.mulesoft.com/gateway/latest/policies-pdk-overview) custom policy that exposes a single **MCP tool** backed by a declarative pipeline of REST API calls — with sequential and parallel stages, DataWeave transforms, and per-call authentication.
 
 ## Overview
 
@@ -96,7 +96,7 @@ stages:
 ### Prerequisites
 
 - [Rust](https://rustup.rs/) ≥ 1.88
-- [Docker](https://www.docker.com/) (for the Flex Gateway playground)
+- [Docker](https://www.docker.com/) (for the Omni Gateway playground)
 - [anypoint-cli-v4](https://docs.mulesoft.com/anypoint-cli/latest/)
 
 ### Build
@@ -107,7 +107,7 @@ cargo build --release
 
 ### Run locally
 
-Start the Flex Gateway playground with the policy applied:
+Start the Omni Gateway playground with the policy applied:
 
 ```bash
 make run
