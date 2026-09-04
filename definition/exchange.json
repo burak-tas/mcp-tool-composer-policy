@@ -1,0 +1,7 @@
+{
+  "assetId": "mcp-tool-composer-policy",
+  "groupId": "96a7526c-e657-42de-919e-0b7bdfab7a80",
+  "version": "0.1.0",
+  "name": "MCP Tool Composer Policy",
+  "main": "gcl.yaml"
+}

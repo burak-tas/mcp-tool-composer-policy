@@ -10,11 +10,11 @@ crate-type = ["cdylib", "rlib"]
 
 [package.metadata.anypoint]
 group_id = "96a7526c-e657-42de-919e-0b7bdfab7a80"
-definition_asset_id = "mcp-tool-composer-policy"
+definition_asset_id = { name = "mcp-tool-composer-policy", version = "0.1.0" }
 implementation_asset_id = "mcp-tool-composer-policy-impl"
 
 [dependencies]
-pdk = { version = "1.10.0", features = ["enable_stop_iteration"] }
+pdk = "1.10.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["alloc", "preserve_order"] }
 anyhow = "1.0"
