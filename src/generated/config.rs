@@ -66,6 +66,8 @@ pub struct Config {
     pub output_transform: Option<pdk::script::Script>,
     #[serde(alias = "perRequestTimeoutMs")]
     pub per_request_timeout_ms: Option<i64>,
+    #[serde(alias = "pipelineTimeoutMs")]
+    pub pipeline_timeout_ms: Option<i64>,
     #[serde(alias = "stages")]
     pub stages: Vec<Stages0Config>,
     #[serde(alias = "strictMode")]

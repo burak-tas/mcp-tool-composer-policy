@@ -5,11 +5,12 @@
 //! `futures::future::join_all` — wall-clock cost = slowest call in the stage.
 //!
 //! Auth fix: credential templates (e.g. "${steps.authenticate}") are resolved
-//! through `expr::interpolate` before building auth headers, so dynamic tokens
-//! from earlier pipeline steps work correctly.
+//! through `expr::interpolate` before building auth headers.
 //!
-//! Passthrough auth: when authType=passthrough the incoming Authorization
-//! header from the MCP client is forwarded unchanged to the backend call.
+//! Global deadline: the configured `pipelineTimeoutMs` caps the total wall-clock
+//! duration of all stages combined. Completed stages are NOT rolled back when a
+//! later stage fails — operators should use idempotency keys or compensating
+//! actions for mutating pipelines.
 
 pub mod expr;
 
@@ -40,6 +41,12 @@ pub enum PipelineError {
 
     #[error("call '{call}' returned non-JSON body: {message}")]
     BadJson { call: String, message: String },
+
+    #[error("call '{call}' timed out")]
+    Timeout { call: String },
+
+    #[error("pipeline exceeded global deadline")]
+    GlobalTimeout,
 }
 
 /// Maps each call name to its registered Flex Gateway `Service` handle.
@@ -50,6 +57,13 @@ pub type ServiceMap = HashMap<String, Rc<Service>>;
 /// `args` is the (already DataWeave-transformed) input from the MCP client.
 /// `incoming_auth` is the raw Authorization header value from the MCP request,
 /// forwarded as-is for calls with authType=passthrough.
+///
+/// ## Cancellation and rollback
+///
+/// When a stage fails, execution stops and the error is returned. Stages that
+/// already completed are NOT rolled back — their side effects (e.g. order
+/// creation, payment charges) cannot be undone by this policy. Operators should
+/// design mutating pipelines with idempotency keys or compensating actions.
 pub async fn run_pipeline(
     config: &PolicyConfig,
     services: &ServiceMap,
@@ -59,20 +73,34 @@ pub async fn run_pipeline(
 ) -> Result<PipelineResult, PipelineError> {
     let mut step_outputs: StepOutputs = HashMap::new();
 
+    // Track elapsed time against the global pipeline deadline.
+    let deadline_ms = config.pipeline_timeout_ms as u64;
+    let mut elapsed_ms: u64 = 0;
+
     for stage in &config.stages {
         match stage {
             Stage::Sequential(call) => {
+                if elapsed_ms >= deadline_ms {
+                    return Err(PipelineError::GlobalTimeout);
+                }
+                let remaining_ms = deadline_ms - elapsed_ms;
+                let call_timeout_ms =
+                    call.timeout_ms.unwrap_or(config.per_request_timeout_ms) as u64;
+                let effective_timeout_ms = call_timeout_ms.min(remaining_ms);
+
                 let service = services.get(&call.name).expect("service map out of sync");
+                let start = std::time::Instant::now();
                 let output = execute_call(
                     call,
                     service,
                     args,
                     &step_outputs,
                     http_client,
-                    config,
+                    effective_timeout_ms as u32,
                     incoming_auth,
                 )
                 .await;
+                elapsed_ms += start.elapsed().as_millis() as u64;
 
                 match output {
                     Ok(v) => {
@@ -91,6 +119,11 @@ pub async fn run_pipeline(
             }
 
             Stage::Parallel(calls) => {
+                if elapsed_ms >= deadline_ms {
+                    return Err(PipelineError::GlobalTimeout);
+                }
+                let remaining_ms = deadline_ms - elapsed_ms;
+
                 // Snapshot outputs so all parallel calls see the same prior state.
                 let snapshot = step_outputs.clone();
 
@@ -99,19 +132,24 @@ pub async fn run_pipeline(
                     .map(|call| {
                         let service =
                             services.get(&call.name).expect("service map out of sync");
+                        let call_timeout_ms =
+                            call.timeout_ms.unwrap_or(config.per_request_timeout_ms) as u64;
+                        let effective_timeout_ms = call_timeout_ms.min(remaining_ms);
                         execute_call(
                             call,
                             service,
                             args,
                             &snapshot,
                             http_client,
-                            config,
+                            effective_timeout_ms as u32,
                             incoming_auth,
                         )
                     })
                     .collect();
 
+                let start = std::time::Instant::now();
                 let results = join_all(futures).await;
+                elapsed_ms += start.elapsed().as_millis() as u64;
 
                 let mut fatal: Option<PipelineError> = None;
                 for (call, result) in calls.iter().zip(results.into_iter()) {
@@ -168,7 +206,7 @@ async fn execute_call(
     args: &Value,
     step_outputs: &StepOutputs,
     http_client: &HttpClient,
-    config: &PolicyConfig,
+    timeout_ms: u32,
     incoming_auth: Option<&str>,
 ) -> Result<Value, PipelineError> {
     let path = expr::interpolate(&call.path, args, step_outputs);
@@ -183,9 +221,8 @@ async fn execute_call(
         ("accept".into(), "application/json".into()),
     ];
 
-    // Auth — resolve credential templates through expr::interpolate before building
-    // the auth header. This fixes the bug where "${steps.authenticate}" was never
-    // expanded in the old auth_header() call.
+    // Auth — resolve credential templates through expr::interpolate before
+    // building the auth header so ${steps.*} tokens work correctly.
     match &call.auth {
         AuthConfig::Passthrough => {
             if let Some(auth_val) = incoming_auth {
@@ -211,9 +248,7 @@ async fn execute_call(
     let header_refs: Vec<(&str, &str)> =
         headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
-    let timeout = Duration::from_millis(
-        call.timeout_ms.unwrap_or(config.per_request_timeout_ms).into(),
-    );
+    let timeout = Duration::from_millis(timeout_ms.into());
 
     logger::debug!(
         "mcp-tool-composer: call '{}' {} {}",

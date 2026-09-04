@@ -1,7 +1,5 @@
 //! MCP Tool Composer Policy — entrypoint.
 //!
-//! Exposes a single MCP tool via Flex Gateway's Streamable HTTP transport.
-//!
 //! Request flow for tools/call:
 //!   1. inputTransform (DataWeave) reshapes MCP args → pipeline args
 //!   2. Pipeline executes stages (sequential + parallel REST calls)
@@ -23,8 +21,8 @@ use serde_json::{json, Value};
 use crate::config::PolicyConfig;
 use crate::generated::config::Config;
 use crate::jsonrpc::{
-    error_response, error_response_with_data, success_response, JsonRpcOutbound, JsonRpcRequest,
-    INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR,
+    error_response, success_response, tool_error_response, JsonRpcOutbound, JsonRpcRequest,
+    INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR,
 };
 use crate::pipeline::{PipelineError, ServiceMap};
 
@@ -32,6 +30,8 @@ const POLICY_NAME: &str = "mcp-tool-composer";
 const CONTENT_TYPE_HEADER: &str = "content-type";
 const CONTENT_LENGTH_HEADER: &str = "content-length";
 const APPLICATION_JSON: &str = "application/json";
+// The single MCP protocol version this policy implements (HTTP+SSE transport).
+const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
 // ---------------------------------------------------------------------------
 // Request filter
@@ -75,6 +75,15 @@ async fn request_filter(
         return send_error(405, "Use POST for MCP requests");
     }
 
+    // Validate Content-Type for POST — must be application/json.
+    let content_type = request.handler().header("content-type").unwrap_or_default();
+    if !content_type.contains("application/json") {
+        return send_json_rpc(
+            200,
+            &error_response(None, INVALID_REQUEST, "Content-Type must be application/json"),
+        );
+    }
+
     // Capture incoming Authorization header for passthrough auth calls.
     let incoming_auth: Option<String> = request.handler().header("authorization");
 
@@ -91,10 +100,8 @@ async fn request_filter(
         }
     };
 
-    if rpc.is_notification() {
-        return send_raw(202, &[(CONTENT_TYPE_HEADER, APPLICATION_JSON)], b"{}");
-    }
-
+    // Validate jsonrpc version and method presence BEFORE treating id-less
+    // messages as notifications — a malformed envelope is always an error.
     if rpc.jsonrpc.as_deref() != Some("2.0") {
         return send_json_rpc(
             200,
@@ -112,13 +119,18 @@ async fn request_filter(
         }
     };
 
+    // After envelope validation: id-less messages are notifications — 202, empty body.
+    if rpc.is_notification() {
+        return send_raw(202, &[(CONTENT_TYPE_HEADER, APPLICATION_JSON)], b"");
+    }
+
     match method_name.as_str() {
         "initialize" => handle_initialize(rpc.id),
 
         "ping" => send_json_rpc(200, &success_response(rpc.id, json!({}))),
 
         "notifications/initialized" | "notifications/cancelled" => {
-            send_raw(202, &[(CONTENT_TYPE_HEADER, APPLICATION_JSON)], b"{}")
+            send_raw(202, &[(CONTENT_TYPE_HEADER, APPLICATION_JSON)], b"")
         }
 
         "tools/list" => handle_tools_list(&policy, rpc.id),
@@ -157,7 +169,7 @@ fn handle_initialize(id: Option<Value>) -> Flow<()> {
         &success_response(
             id,
             json!({
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": MCP_PROTOCOL_VERSION,
                 "serverInfo": {
                     "name": POLICY_NAME,
                     "version": env!("CARGO_PKG_VERSION"),
@@ -205,11 +217,36 @@ async fn handle_tools_call(
         );
     }
 
-    let raw_args = params.get("arguments").cloned().unwrap_or(json!({}));
+    // arguments must be an object when present.
+    let raw_args = match params.get("arguments") {
+        Some(Value::Object(_)) | None => params.get("arguments").cloned().unwrap_or(json!({})),
+        Some(other) => {
+            return send_json_rpc(
+                200,
+                &error_response(
+                    id,
+                    INVALID_PARAMS,
+                    format!("'arguments' must be a JSON object, got {}", other),
+                ),
+            );
+        }
+    };
+
+    // Validate required fields declared in toolInputSchema before running any transform.
+    if let Some(err_msg) = validate_args(&raw_args, &policy.tool_input_schema) {
+        return send_json_rpc(200, &error_response(id, INVALID_PARAMS, err_msg));
+    }
 
     // 1. Apply inputTransform — reshape args before pipeline.
-    let pipeline_args =
-        dw::eval_transform(raw_config.input_transform.as_ref(), &raw_args);
+    let pipeline_args = match dw::eval_transform(raw_config.input_transform.as_ref(), &raw_args) {
+        Ok(v) => v,
+        Err(e) => {
+            return send_json_rpc(
+                200,
+                &tool_error_response(id, format!("inputTransform failed: {e}"), "transform_error"),
+            );
+        }
+    };
 
     // 2. Execute pipeline.
     let pipeline_result = match pipeline::run_pipeline(
@@ -222,32 +259,104 @@ async fn handle_tools_call(
     .await
     {
         Ok(r) => r,
+        // Downstream execution failures → CallToolResult with isError:true so
+        // MCP clients and models can inspect and recover.
         Err(PipelineError::HttpStatus { call, status }) => {
             return send_json_rpc(
                 200,
-                &error_response_with_data(
+                &tool_error_response(
                     id,
-                    INTERNAL_ERROR,
-                    format!("Call '{call}' returned HTTP {status}"),
-                    json!({ "call": call, "httpStatus": status }),
+                    format!("call '{}' returned HTTP {}", call, status),
+                    "http_error",
                 ),
-            )
+            );
         }
-        Err(e) => {
-            logger::error!("[{}] pipeline error: {}", POLICY_NAME, e);
-            return send_json_rpc(200, &error_response(id, INTERNAL_ERROR, e.to_string()));
+        Err(PipelineError::Transport { call, message }) => {
+            logger::error!("[{}] transport error on '{}': {}", POLICY_NAME, call, message);
+            return send_json_rpc(
+                200,
+                &tool_error_response(
+                    id,
+                    format!("call '{}' transport error", call),
+                    "transport_error",
+                ),
+            );
+        }
+        Err(PipelineError::BadJson { call, .. }) => {
+            return send_json_rpc(
+                200,
+                &tool_error_response(
+                    id,
+                    format!("call '{}' returned non-JSON response", call),
+                    "parse_error",
+                ),
+            );
+        }
+        Err(PipelineError::Timeout { call }) => {
+            return send_json_rpc(
+                200,
+                &tool_error_response(id, format!("call '{}' timed out", call), "timeout"),
+            );
+        }
+        Err(PipelineError::GlobalTimeout) => {
+            return send_json_rpc(
+                200,
+                &tool_error_response(id, "pipeline exceeded global deadline", "timeout"),
+            );
         }
     };
 
     // 3. Apply outputTransform — shape the composite result for the MCP client.
-    let final_value =
-        dw::eval_transform(raw_config.output_transform.as_ref(), &pipeline_result.final_output);
+    let final_value = match dw::eval_transform(
+        raw_config.output_transform.as_ref(),
+        &pipeline_result.final_output,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            return send_json_rpc(
+                200,
+                &tool_error_response(
+                    id,
+                    format!("outputTransform failed: {e}"),
+                    "transform_error",
+                ),
+            );
+        }
+    };
 
     let content = json!([{
         "type": "text",
         "text": final_value.to_string(),
     }]);
-    send_json_rpc(200, &success_response(id, json!({ "content": content })))
+    send_json_rpc(
+        200,
+        &success_response(id, json!({ "content": content, "isError": false })),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Argument validation (JSON Schema subset: required array)
+// ---------------------------------------------------------------------------
+
+/// Check `required` fields from the toolInputSchema. Returns `Some(error_message)`
+/// when required fields are missing, `None` when valid.
+fn validate_args(args: &Value, schema: &Value) -> Option<String> {
+    let required = match schema.get("required") {
+        Some(Value::Array(arr)) => arr,
+        _ => return None,
+    };
+
+    let missing: Vec<&str> = required
+        .iter()
+        .filter_map(|v| v.as_str())
+        .filter(|field| args.get(field).is_none())
+        .collect();
+
+    if missing.is_empty() {
+        None
+    } else {
+        Some(format!("missing required argument(s): {}", missing.join(", ")))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -292,15 +401,20 @@ pub async fn configure(
     let policy = PolicyConfig::from_config(&raw)
         .map_err(|e| anyhow::anyhow!("policy configuration rejected: {e}"))?;
 
-    let masked: Vec<&str> = policy.all_calls().filter(|c| c.mask_in_output).map(|c| c.name.as_str()).collect();
+    let masked: Vec<&str> = policy
+        .all_calls()
+        .filter(|c| c.mask_in_output)
+        .map(|c| c.name.as_str())
+        .collect();
     logger::info!(
-        "[{}] loaded '{}'; {} stage(s), {} call(s); endpoint='{}'; masked=[{}]",
+        "[{}] loaded '{}'; {} stage(s), {} call(s); endpoint='{}'; masked=[{}]; deadline={}ms",
         POLICY_NAME,
         policy.tool_name,
         policy.stages.len(),
         policy.all_calls().count(),
         policy.mcp_endpoint,
         masked.join(", "),
+        policy.pipeline_timeout_ms,
     );
 
     // Build service map: call name → registered Flex Gateway Service handle.

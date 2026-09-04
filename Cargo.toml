@@ -14,7 +14,7 @@ definition_asset_id = "mcp-tool-composer-policy"
 implementation_asset_id = "mcp-tool-composer-policy-impl"
 
 [dependencies]
-pdk = "1.10.0"
+pdk = { version = "1.10.0", features = ["enable_stop_iteration"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["alloc", "preserve_order"] }
 anyhow = "1.0"
@@ -23,7 +23,7 @@ base64 = "0.22"
 futures = { version = "0.3", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
-pdk-unit = "1.10.0"
+pdk-unit = { version = "1.10.0", features = ["enable_stop_iteration"] }
 
 [profile.release]
 lto = true

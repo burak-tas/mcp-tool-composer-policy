@@ -1,13 +1,14 @@
 //! Minimal JSON-RPC 2.0 envelope types for MCP Streamable HTTP transport.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 // Error codes from the MCP / JSON-RPC spec.
 pub const PARSE_ERROR: i32 = -32700;
 pub const INVALID_REQUEST: i32 = -32600;
 pub const METHOD_NOT_FOUND: i32 = -32601;
 pub const INVALID_PARAMS: i32 = -32602;
+#[allow(dead_code)]
 pub const INTERNAL_ERROR: i32 = -32603;
 
 /// Inbound JSON-RPC request envelope.
@@ -67,20 +68,24 @@ pub fn error_response(id: Option<Value>, code: i32, message: impl Into<String>) 
     }
 }
 
-pub fn error_response_with_data(
+/// Return a successful JSON-RPC response whose `result` is a `CallToolResult`
+/// with `isError: true` — used for tool execution failures (downstream HTTP
+/// errors, timeouts, bad JSON) so MCP clients can distinguish them from
+/// protocol errors and attempt recovery.
+///
+/// `category` is a short machine-readable label included in the text content
+/// (e.g. "http_error", "timeout", "parse_error") so agents can act on it.
+pub fn tool_error_response(
     id: Option<Value>,
-    code: i32,
     message: impl Into<String>,
-    data: Value,
+    category: &str,
 ) -> JsonRpcOutbound {
-    JsonRpcOutbound {
-        jsonrpc: "2.0",
+    let msg = message.into();
+    success_response(
         id,
-        result: None,
-        error: Some(JsonRpcError {
-            code,
-            message: message.into(),
-            data: Some(data),
+        json!({
+            "content": [{ "type": "text", "text": format!("[{}] {}", category, msg) }],
+            "isError": true,
         }),
-    }
+    )
 }

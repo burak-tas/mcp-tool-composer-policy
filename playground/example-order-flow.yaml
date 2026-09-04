@@ -8,6 +8,18 @@
 #   Stage 4 (sequential)  createOrder               200ms
 #                                                   ------
 #                         Total                     800ms  (vs 1000ms all-sequential)
+#
+# Credential model
+# ─────────────────
+# Supported credential sources:
+#   • Static values — literal strings in token/password/apiKey fields (marked sensitive in GCL).
+#   • Step-derived  — ${steps.<callName>} resolves to a token obtained at runtime, e.g. from
+#                     an auth service call earlier in the pipeline (see Stage 1 + Stage 2 below).
+#   • Passthrough   — forwards the incoming MCP request's Authorization header unchanged.
+#
+# ${env.*} expressions are NOT supported and resolve to an empty string.
+# Store secrets as policy configuration properties (marked security:sensitive in GCL);
+# they are encrypted at rest by the Anypoint platform and never appear in logs.
 
 toolName: createOrder
 toolDescription: >
@@ -29,6 +41,7 @@ toolInputSchema: |
 mcpEndpoint: /mcp
 strictMode: true
 perRequestTimeoutMs: 15000
+pipelineTimeoutMs: 60000
 
 # inputTransform: normalize and upper-case the customer ID before the pipeline.
 inputTransform: "#[{customerId: payload.customerId upper, productSku: payload.productSku, quantity: payload.quantity}]"
@@ -45,10 +58,11 @@ stages:
         path: /token
         authType: basicAuth
         username: svc-composer
-        password: "${env.AUTH_PASSWORD}"
+        password: "s3cr3t-change-me"   # store in Anypoint Secrets Manager in production
         bodyTemplate: '{"clientId":"${args.customerId}","scope":"orders"}'
         stopOnError: true
         outputExtract: access_token   # ${steps.authenticate} = the token string
+        maskInOutput: true            # hide the token from the MCP tool result
 
   # ── Stage 2: parallel ───────────────────────────────────────────────────────
   - parallel: true
@@ -58,7 +72,7 @@ stages:
         method: GET
         path: /customers/${args.customerId}
         authType: bearerToken
-        token: "${steps.authenticate}"   # ← now correctly resolved via expr::interpolate
+        token: "${steps.authenticate}"   # step-derived — resolved from Stage 1 output
         stopOnError: true
         outputExtract: data
 
@@ -68,7 +82,7 @@ stages:
         path: /inventory/${args.productSku}
         authType: apiKeyHeader
         headerName: x-api-key
-        apiKey: "${env.WMS_API_KEY}"
+        apiKey: "wms-api-key-change-me"  # static API key — store in Anypoint Secrets Manager
         stopOnError: false               # low-stock warning, not fatal
         outputExtract: available
 

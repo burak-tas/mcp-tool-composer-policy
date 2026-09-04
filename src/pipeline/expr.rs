@@ -9,6 +9,9 @@
 //! are unquoted, numbers/booleans/null use their JSON representation).
 //! An expression that resolves to a missing key is replaced with the empty
 //! string rather than failing, keeping error handling in the caller.
+//!
+//! Unsupported prefixes (e.g. `${env.*}`) also resolve to an empty string.
+//! They are not documented as a supported feature: do not use them in config.
 
 use serde_json::Value;
 use std::collections::HashMap;

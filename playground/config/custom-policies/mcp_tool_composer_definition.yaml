@@ -214,6 +214,15 @@ spec:
       maximum: 600000
       default: 30000
       description: Default per-call timeout (ms). Overridable per call via timeoutMs.
+
+    pipelineTimeoutMs:
+      type: integer
+      minimum: 1000
+      maximum: 600000
+      default: 60000
+      description: >
+        Global wall-clock deadline for the entire pipeline (all stages combined),
+        in milliseconds. Default: 60000 (60 s).
   required:
     - toolName
     - toolDescription

@@ -252,6 +252,18 @@ spec:
       default: 30000
       description: Default per-call timeout (ms). Overridable per call via timeoutMs.
 
+    pipelineTimeoutMs:
+      type: integer
+      minimum: 1000
+      maximum: 600000
+      default: 60000
+      description: >
+        Global wall-clock deadline for the entire pipeline (all stages combined),
+        in milliseconds. When this deadline is exceeded the pipeline is aborted and
+        a tool execution error is returned. Default: 60000 (60 s). Maximum: 600000
+        (600 s). Note: completed stages are NOT rolled back on failure — design
+        mutating pipelines with idempotency keys or compensating actions.
+
   required:
     - toolName
     - toolDescription

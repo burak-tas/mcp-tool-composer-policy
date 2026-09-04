@@ -196,6 +196,8 @@ pub struct PolicyConfig {
     pub tool_input_schema: Value,
     pub stages: Vec<Stage>,
     pub per_request_timeout_ms: u32,
+    /// Global wall-clock cap for the entire pipeline (all stages combined).
+    pub pipeline_timeout_ms: u32,
 }
 
 impl PolicyConfig {
@@ -221,6 +223,10 @@ impl PolicyConfig {
 
         let per_request_timeout_ms =
             clamp_u32(raw.per_request_timeout_ms, 100, 600_000, 30_000);
+
+        // Global pipeline deadline: default 60 s, max 600 s (same ceiling as per-call).
+        let pipeline_timeout_ms =
+            clamp_u32(raw.pipeline_timeout_ms, 1_000, 600_000, 60_000);
 
         let mut all_call_names: Vec<String> = Vec::new();
         let mut total_calls: usize = 0;
@@ -256,7 +262,8 @@ impl PolicyConfig {
 
             let call_defs = parse_calls(si, &raw_stage.calls, &mut all_call_names)?;
 
-            // Validate: parallel calls must not reference sibling outputs.
+            // Validate: parallel calls must not reference sibling outputs in any
+            // interpolated field (path, body, auth credentials, custom headers).
             if parallel {
                 let sibling_names: Vec<&str> =
                     call_defs.iter().map(|c| c.name.as_str()).collect();
@@ -266,15 +273,29 @@ impl PolicyConfig {
                             continue;
                         }
                         let ref_pat = format!("${{steps.{}", sibling);
-                        let body_refs = call
-                            .body_template
-                            .as_deref()
-                            .map(|t| t.contains(&ref_pat))
-                            .unwrap_or(false);
-                        if body_refs || call.path.contains(&ref_pat) {
+                        let mut bad_field: Option<&str> = None;
+
+                        if call.path.contains(&ref_pat) {
+                            bad_field = Some("path");
+                        } else if call.body_template.as_deref().map(|t| t.contains(&ref_pat)).unwrap_or(false) {
+                            bad_field = Some("bodyTemplate");
+                        } else if let Some(cred) = call.auth.raw_credential() {
+                            if cred.contains(&ref_pat) {
+                                bad_field = Some("auth credential");
+                            }
+                        } else {
+                            for (_, hv) in &call.extra_headers {
+                                if hv.contains(&ref_pat) {
+                                    bad_field = Some("header value");
+                                    break;
+                                }
+                            }
+                        }
+
+                        if let Some(field) = bad_field {
                             return Err(ConfigError::Invalid(format!(
-                                "stage[{si}] call '{}': references sibling '{}' inside same parallel stage",
-                                call.name, sibling
+                                "stage[{si}] call '{}': {} references sibling '{}' inside same parallel stage",
+                                call.name, field, sibling
                             )));
                         }
                     }
@@ -297,6 +318,7 @@ impl PolicyConfig {
             tool_input_schema,
             stages,
             per_request_timeout_ms,
+            pipeline_timeout_ms,
         })
     }
 
