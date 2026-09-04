@@ -56,30 +56,20 @@ spec:
     inputTransform:
       type: string
       format: dataweave
-      default: "#[vars.payload]"
+      default: "#[payload]"
       description: >
         DataWeave expression applied to the incoming MCP tool arguments
         before the pipeline runs. Result becomes ${args.*} inside stages.
-        Use vars.payload to access the incoming arguments.
-        Example: "#[{customerId: vars.payload.id upper, amount: vars.payload.qty * vars.payload.unitPrice}]"
-      bindings:
-        vars:
-          payload:
-            mimeType: json
+        Example: "#[{customerId: payload.id upper, amount: payload.qty * payload.unitPrice}]"
 
     outputTransform:
       type: string
       format: dataweave
-      default: "#[vars.payload]"
+      default: "#[payload]"
       description: >
         DataWeave expression applied to the composite pipeline output
         (object keyed by call name) before returning the MCP tool result.
-        Use vars.payload to access the pipeline result object.
-        Example: "#[{orderId: vars.payload.createOrder.orderId, status: vars.payload.createOrder.status}]"
-      bindings:
-        vars:
-          payload:
-            mimeType: json
+        Example: "#[{orderId: payload.createOrder.orderId, status: payload.createOrder.status}]"
 
     # ------------------------------------------------------------------
     # Execution pipeline — ordered list of stages
