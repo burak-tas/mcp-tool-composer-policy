@@ -7,7 +7,6 @@ A [Omni Gateway PDK](https://docs.mulesoft.com/gateway/latest/policies-pdk-overv
 | Scenario | Policy to use |
 |---|---|
 | One MCP tool → one REST API call | **MCP Transcoding** (built-in) |
-| One MCP tool → call a GraphQL endpoint | **MCP GraphQL Transcoding** (built-in) |
 | **One MCP tool → multiple REST APIs in sequence or parallel** | **This policy** |
 | Multiple MCP tools, each with their own backend | Apply this policy once per tool, or use a router pattern |
 
