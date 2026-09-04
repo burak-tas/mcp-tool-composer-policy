@@ -1,21 +1,19 @@
 # Test Report — MCP Tool Composer Policy
 
-**Date:** 2026-09-02 | **Flex Gateway:** 1.9.3 | **Policy:** v0.1.0
+**Date:** 2026-09-04 | **Flex Gateway:** 1.9.3 | **Policy:** v0.1.0
 **Backend:** 4 A2D mock REST APIs | **Pipeline:** 3 stages, 4 calls
+**Commit under test:** `2eb4347`
 
 ---
 
 ## Pipeline under test
 
 ```
-Stage 1 (sequential)   Auth Service    → none auth      → extracts access_token
+Stage 1 (sequential)   Auth Service    → none auth      → extracts access_token (maskInOutput: true)
 Stage 2 (parallel)     Customer API    → Bearer token   → returns customer profile
                        Inventory API   → X-API-Key      → returns stock level
 Stage 3 (sequential)   Orders API      → Basic auth     → creates order
 ```
-
-`getToken` is configured with `maskInOutput: true` — the token is replaced with `"***"` in the MCP
-response while still flowing through the pipeline so downstream `${steps.getToken}` expressions resolve.
 
 ---
 
@@ -26,7 +24,7 @@ response while still flowing through the pipeline so downstream `${steps.getToke
 | Stage 1 | `getToken` | `none` | `***` ✅ (masked — token used internally for Stage 2) |
 | Stage 2 | `fetchCustomer` | `bearerToken` → `Authorization: Bearer <token>` | `{ id: CUST-001, name: Acme Corp, tier: enterprise, creditLimit: 50000 }` ✅ |
 | Stage 2 | `checkInventory` | `apiKeyHeader` → `X-API-Key: inv-api-key-mcp-composer-2026` | `{ sku: SKU-7842, name: Industrial Sensor v3, stockLevel: 142, available: true }` ✅ |
-| Stage 3 | `createOrder` | `basicAuth` → `Authorization: Basic b3JkZXJzLXN2Yz…` | `{ orderId: ORD-20260902-0041, status: confirmed, totalAmount: 1499.95 EUR, estimatedDelivery: 2026-09-05 }` ✅ |
+| Stage 3 | `createOrder` | `basicAuth` → `Authorization: Basic b3JkZXJzLXN2Yz…` | `{ orderId: ORD-…, status: confirmed }` ✅ |
 
 ---
 
@@ -35,11 +33,11 @@ response while still flowing through the pipeline so downstream `${steps.getToke
 | Stage | Call | Auth Type | Response |
 |---|---|---|---|
 | Stage 1 | `getToken` | `none` | `***` ✅ (masked) |
-| Stage 2 | `fetchCustomer` | `bearerToken` | `{ id: CUST-001, name: Acme Corp, tier: enterprise, creditLimit: 50000 }` ✅ |
-| Stage 2 | `checkInventory` | `apiKeyHeader` | `{ sku: SKU-0000, name: Unknown Product, stockLevel: 0, available: false }` ⚠️ continues |
-| Stage 3 | `createOrder` | `basicAuth` | `{ orderId: ORD-20260902-0041, status: confirmed, totalAmount: 1499.95 EUR }` ✅ |
+| Stage 2 | `fetchCustomer` | `bearerToken` | `{ id: CUST-001, name: Acme Corp, tier: enterprise }` ✅ |
+| Stage 2 | `checkInventory` | `apiKeyHeader` | `{ sku: SKU-0000, available: false }` ⚠️ continues |
+| Stage 3 | `createOrder` | `basicAuth` | `{ status: confirmed }` ✅ |
 
-> Stage 2 inventory call returned out-of-stock data but did **not** abort the pipeline — `stopOnError: false` worked as designed.
+> `stopOnError: false` — out-of-stock did not abort the pipeline.
 
 ---
 
@@ -47,14 +45,10 @@ response while still flowing through the pipeline so downstream `${steps.getToke
 
 | Check | Result |
 |---|---|
-| `getToken` value in MCP response | `***` ✅ (masked) |
-| `fetchCustomer` call succeeded (token was forwarded in `Authorization` header) | `true` ✅ |
+| `getToken` value in MCP response | `***` ✅ |
+| `fetchCustomer` call succeeded (token forwarded in `Authorization` header) | `true` ✅ |
 | Customer name returned | `Acme Corp` ✅ |
 | Order status | `confirmed` ✅ |
-
-> `maskInOutput: true` only redacts the value in the final MCP response. Internally the real token is
-> still stored in `step_outputs` and resolved by `${steps.getToken}` when building the Bearer header
-> for Stage 2 — pipeline execution is unaffected.
 
 ---
 
@@ -62,19 +56,52 @@ response while still flowing through the pipeline so downstream `${steps.getToke
 
 | # | Description | Expected | Actual | Result |
 |---|---|---|---|---|
-| TC-01 | `tools/list` | Tool `createOrder` with full input schema | Correct schema returned | ✅ PASS |
-| TC-02 | **Happy path** — CUST-001 + SKU-7842, qty 5 | All 3 stages complete, token masked in output | All 4 calls succeeded, `getToken: "***"` — see stage table above | ✅ PASS |
+| TC-01 | `tools/list` | Tool `createOrder` with full input schema and `required: [customerId, productSku, quantity]` | Correct schema returned, required array present | ✅ PASS |
+| TC-02 | **Happy path** — CUST-001 + SKU-7842, qty 5 | All 3 stages complete, `isError: false`, token masked | All 4 calls succeeded, `getToken: "***"`, `isError: false` | ✅ PASS |
 | TC-03 | Unknown tool name | JSON-RPC `-32602` with available tools listed | `"Unknown tool 'deleteEverything'. Available: 'createOrder'"` | ✅ PASS |
-| TC-04 | Missing `customerId` argument | Pipeline aborts at `fetchCustomer` | `-32603` · `call: fetchCustomer, httpStatus: 404` | ✅ PASS |
-| TC-05 | Unknown customer (CUST-999) | Mock returns 404 → pipeline aborts | `-32603` · `call: fetchCustomer, httpStatus: 404` | ✅ PASS |
+| TC-04 | Missing `customerId` argument | JSON-RPC `-32602` **before any network call** (schema validation) | `"missing required argument(s): customerId"` — no outbound request made | ✅ PASS |
+| TC-05 | Unknown customer (CUST-999) | `isError: true` with HTTP 404 detail | `[http_error] call 'fetchCustomer' returned HTTP 404`, `isError: true` | ✅ PASS |
 | TC-06 | Non-MCP path with `strictMode: true` | HTTP 404 | HTTP 404 | ✅ PASS |
-| TC-07 | **Happy path** — out-of-stock SKU, `stopOnError: false` | Inventory returns `available: false`, pipeline continues, token masked | Order confirmed, `checkInventory.available: false`, `getToken: "***"` — see stage table above | ✅ PASS |
-| TC-08 | Malformed JSON body | JSON-RPC `-32700 Parse error` | `"Parse error: key must be a string"` | ✅ PASS |
+| TC-07 | **Happy path** — out-of-stock SKU, `stopOnError: false` | Inventory returns `available: false`, pipeline continues, token masked | Order confirmed, `checkInventory.available: false`, `getToken: "***"` | ✅ PASS |
+| TC-08 | Malformed JSON body | JSON-RPC `-32700 Parse error` | `"Parse error: key must be a string at line 1 column 2"` | ✅ PASS |
 | TC-09 | Unsupported method (`resources/list`) | JSON-RPC `-32601 Method not found` | `"Method not supported: resources/list"` | ✅ PASS |
 | TC-10 | GET request without SSE Accept header | HTTP 405 | HTTP 405 | ✅ PASS |
-| TC-11 | **Token masking** — `maskInOutput: true` redacts output but preserves pipeline propagation | `getToken: "***"` in response, `fetchCustomer` still succeeds via `${steps.getToken}` | Token masked, downstream Bearer call succeeded, order confirmed | ✅ PASS |
+| TC-11 | **Token masking** — `maskInOutput: true` output redacted, pipeline propagates internally | `getToken: "***"` in response, `fetchCustomer` still succeeds | Token masked, downstream Bearer call succeeded, order confirmed | ✅ PASS |
+| TC-12 | **P4A → Anypoint deploy** — `make build-asset-files` + publish to Exchange | Build pipeline completes, policy published to Anypoint Exchange | See §TC-12 below | ⏳ |
+| TC-13 | Wrong `Content-Type` (not `application/json`) | JSON-RPC `-32600 Invalid Request` | `"Content-Type must be application/json"` | ✅ PASS |
+| TC-14 | `arguments` field not an object | JSON-RPC `-32602 Invalid Params` | `"'arguments' must be a JSON object, got \"bad\""` | ✅ PASS |
 
-**Overall: 11 / 11 PASS**
+**Functional: 13 / 13 PASS | Deploy: ⏳ pending**
+
+---
+
+## TC-12 — P4A → Anypoint Platform Deploy
+
+### What is tested
+
+The P4A build pipeline clones the GitHub repo at the latest commit (`2eb4347`),
+runs `make build-asset-files` (which calls `anypoint-cli-v4 pdk policy-project build-asset-files`
+to regenerate `src/generated/config.rs` from `definition/gcl.yaml`), compiles the Rust
+crate to `wasm32-wasip1`, and publishes the definition + implementation assets to
+Anypoint Exchange.
+
+### Pre-deploy fixes in this commit
+
+| Fix | Detail |
+|---|---|
+| `definition_asset_id` changed to table form | `{ name = "mcp-tool-composer-policy", version = "0.1.0" }` — bare string caused `[object Object]-v1-0` failure |
+| `definition/exchange.json` committed | Required at definition root; was only in generated `target/` output |
+| `enable_stop_iteration` removed from runtime `pdk` | Flex 1.9.3 does not support the `flex_enable_stop_iteration` ABI command — WASM failed at init |
+| `definition/gcl.yaml` `bindings` map fixed | Invalid YAML map → sequence error in `build-asset-files` (fixed in prior commit) |
+| `.project.yaml` committed | Build runner couldn't locate project root (fixed in prior commit) |
+
+### Result
+
+> **⏳ PENDING — awaiting P4A deploy trigger**
+>
+> To complete this test case: go to [p4a.ai](https://www.p4a.ai), open the
+> **mcp-tool-composer-policy** deployment, click **Deploy**, and paste the build
+> log result here.
 
 ---
 
@@ -83,15 +110,28 @@ response while still flowing through the pipeline so downstream `${steps.getToke
 | API | Auth Type | How credentials are sent | Verified |
 |---|---|---|---|
 | Auth Service | `none` | No auth — `client_id` in body | ✓ Token extracted via `outputExtract: access_token` |
-| Customer API | `bearerToken` | `Authorization: Bearer ${steps.getToken}` | ✓ Token propagated from Stage 1 (internal value, masked in output) |
+| Customer API | `bearerToken` | `Authorization: Bearer ${steps.getToken}` | ✓ Token propagated from Stage 1 (masked in output) |
 | Inventory API | `apiKeyHeader` | `X-API-Key: inv-api-key-mcp-composer-2026` | ✓ Static key set correctly |
 | Orders API | `basicAuth` | `Authorization: Basic <base64(orders-svc:s3cr3t-mcp-2026)>` | ✓ Base64 encoding correct |
 
 ---
 
-## `maskInOutput` Feature
+## Behaviour Changes Since Previous Report (issue-fix round)
 
-Added in this release. Configure per call in the pipeline:
+These cases were **not tested before** and confirm new correctness guarantees:
+
+| Behaviour | Before | After |
+|---|---|---|
+| Schema validation (TC-04) | Missing args caused 404 from backend | `-32602` returned immediately, no network call |
+| Pipeline failures (TC-05) | `-32603 Internal Error` JSON-RPC error | `isError: true` in `CallToolResult` (MCP-compliant) |
+| Success response | No `isError` field | `isError: false` always present on success |
+| Content-Type enforcement (TC-13) | Accepted any Content-Type | `-32600` if not `application/json` |
+| Arguments type check (TC-14) | Non-object arguments silently became `{}` | `-32602` with type detail |
+| DataWeave binding | `bind_vars("payload", …)` → potential panic | `bind_payload(&str)` — correct PDK API, returns `Result` |
+
+---
+
+## `maskInOutput` Feature
 
 ```yaml
 - name: getToken
@@ -103,9 +143,9 @@ Added in this release. Configure per call in the pipeline:
   maskInOutput: true   # ← token replaced with "***" in MCP response
 ```
 
-- The real value is still stored internally and resolved by `${steps.getToken}` in downstream calls.
-- Only the final MCP response is redacted — pipeline execution is unaffected.
-- Default: `false` (no masking).
+- Real value flows internally through `step_outputs`; `${steps.getToken}` resolves normally.
+- Only the final MCP response is redacted.
+- Default: `false`.
 
 ---
 
@@ -113,5 +153,7 @@ Added in this release. Configure per call in the pipeline:
 
 | # | Issue | Impact |
 |---|---|---|
-| L-1 | `outputTransform` with object-literal syntax (`#[{...}]`) not supported in Flex 1.9.3 | All stage outputs are returned in the MCP result — filter with `outputTransform` once object-literal DataWeave support lands |
-| L-2 | A2D mock APIs enforce credential validation server-side — `auth_enabled` must be `false` for isolated policy testing | Test-only workaround; real backends validate normally |
+| L-1 | `outputTransform` with object-literal DataWeave (`#[{...}]`) not supported in Flex 1.9.x | All stage outputs returned in MCP result; filter post-response or wait for PEL update |
+| L-2 | Completed stages are not rolled back on failure | Design mutating pipelines with idempotency keys |
+| L-3 | `enable_stop_iteration` removed from runtime `pdk` for Flex 1.9.3 compatibility | Body-state handlers rely on the flag; future Flex upgrade will re-enable |
+| L-4 | A2D mock APIs: `auth_enabled` must be `false` for isolated policy testing | Test-only workaround; real backends validate normally |
