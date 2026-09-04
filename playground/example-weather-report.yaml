@@ -1,17 +1,23 @@
 # Example: getWeatherReport — public Open-Meteo APIs, no API key required.
-# Good for local playground testing.
 #
 # Pipeline latency (approx):
-#   Stage 1  geocode (sequential)                         ~120ms
+#   Stage 1  geocode (sequential)                              ~120ms
 #   Stage 2  currentWeather + forecast + airQuality (parallel) ~200ms
-#                                                         ──────
-#   Total                                                 ~320ms (vs ~720ms sequential)
+#                                                              ──────
+#   Total                                                      ~320ms (vs ~720ms sequential)
+#
+# Input:  { "city": "Istanbul" }
+# Output: raw composite object with keys: geocode, currentWeather, forecast, airQuality
+#
+# NOTE: inputTransform / outputTransform are omitted intentionally.
+# DataWeave compilation at policy init is not supported on Flex Gateway 1.9.x
+# (limitation L-3). Use the raw composite output directly from steps.*
 
 toolName: getWeatherReport
 toolDescription: >
   Returns a weather report for any city: current conditions, 7-day forecast,
   and air quality index. Resolves the city name to coordinates first, then
-  fetches all three data sources in parallel.
+  fetches all three data sources in parallel. No API key needed.
 
 toolInputSchema: |
   {
@@ -28,16 +34,11 @@ toolInputSchema: |
 mcpEndpoint: /mcp
 strictMode: true
 perRequestTimeoutMs: 10000
-
-# inputTransform: trim and title-case the city name before geocoding.
-inputTransform: "#[{city: payload.city trim}]"
-
-# outputTransform: return a clean summary instead of the raw composite output.
-outputTransform: "#[{city: payload.geocode.name, country: payload.geocode.country_code, tempC: payload.currentWeather.temperature_2m, humidity: payload.currentWeather.relative_humidity_2m, windKph: payload.currentWeather.wind_speed_10m, aqi: payload.airQuality.us_aqi, forecast: payload.forecast}]"
+pipelineTimeoutMs: 60000
 
 stages:
 
-  # ── Stage 1: sequential ────────────────────────────────────────────────────
+  # ── Stage 1: Geocoding (sequential) ─────────────────────────────────────────
   - calls:
       - name: geocode
         endpoint: https://geocoding-api.open-meteo.com
@@ -47,9 +48,10 @@ stages:
         stopOnError: true
         outputExtract: results.0
 
-  # ── Stage 2: parallel ──────────────────────────────────────────────────────
+  # ── Stage 2: 3 data sources in parallel ─────────────────────────────────────
   - parallel: true
     calls:
+
       - name: currentWeather
         endpoint: https://api.open-meteo.com
         method: GET
@@ -71,5 +73,5 @@ stages:
         method: GET
         path: /v1/air-quality?latitude=${steps.geocode.latitude}&longitude=${steps.geocode.longitude}&current=us_aqi,pm10,pm2_5
         authType: none
-        stopOnError: false   # degrades gracefully if AQ API is down
+        stopOnError: false   # graceful degradation if AQ API is down
         outputExtract: current

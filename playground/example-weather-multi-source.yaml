@@ -1,21 +1,24 @@
-# Demo: getWeatherMultiSource — Wetter von 3 unabhängigen Quellen gleichzeitig.
-# Kein API-Key erforderlich. Alle Services sind kostenlos und öffentlich.
+# Example: getWeatherMultiSource — weather from 3 independent sources simultaneously.
+# No API key required. All services are free and public.
 #
-# Pipeline-Ablauf:
-#   Stage 1  geocode (sequenziell)                         ~100ms
-#   Stage 2  weather + airQuality + wttrWeather (parallel) ~200ms
-#                                                          ──────
-#   Gesamt                                                 ~300ms (statt ~600ms sequenziell)
+# Pipeline latency (approx):
+#   Stage 1  geocode (sequential)                              ~100ms
+#   Stage 2  weather + airQuality + wttrWeather (parallel)     ~200ms
+#                                                              ──────
+#   Total                                                      ~300ms (vs ~600ms sequential)
 #
-# User gibt ein: { "city": "Berlin" }
-# User erhält:   Ergebnisse von 3 Quellen, jeweils mit Quellenangabe
+# Input:  { "city": "Berlin" }
+# Output: raw composite object with keys: geocode, weather, airQuality, wttrWeather
+#
+# NOTE: inputTransform / outputTransform are omitted intentionally.
+# DataWeave compilation at policy init is not supported on Flex Gateway 1.9.x
+# (limitation L-3). Use the raw composite output directly from steps.*
 
 toolName: getWeatherMultiSource
 toolDescription: >
-  Gibt das aktuelle Wetter für eine Stadt zurück, abgefragt von
-  3 unabhängigen Quellen gleichzeitig: Open-Meteo (Wetter & Wind),
-  Open-Meteo Air Quality (Luftqualität) und wttr.in (2. Wetterquelle).
-  Jedes Ergebnis enthält die Quellenangabe.
+  Returns current weather for a city from 3 independent sources simultaneously:
+  Open-Meteo (temperature, wind, humidity), Open-Meteo Air Quality (AQI, PM10,
+  PM2.5), and wttr.in (second weather source with description). No API key needed.
 
 toolInputSchema: |
   {
@@ -23,7 +26,7 @@ toolInputSchema: |
     "properties": {
       "city": {
         "type": "string",
-        "description": "Stadtname, z.B. Berlin, Istanbul, Tokyo"
+        "description": "City name, e.g. Berlin, Istanbul, Tokyo"
       }
     },
     "required": ["city"]
@@ -32,28 +35,25 @@ toolInputSchema: |
 mcpEndpoint: /mcp
 strictMode: true
 perRequestTimeoutMs: 10000
-
-inputTransform: "#[{city: payload.city trim}]"
-
-outputTransform: "#[{city: payload.geocode.name, country: payload.geocode.country_code, latitude: payload.geocode.latitude, longitude: payload.geocode.longitude, sources: [{source: 'open-meteo.com', label: 'Wetter und Wind', tempC: payload.weather.temperature_2m, feelsLikeC: payload.weather.apparent_temperature, windKph: payload.weather.wind_speed_10m, humidity: payload.weather.relative_humidity_2m, weatherCode: payload.weather.weather_code}, {source: 'air-quality-api.open-meteo.com', label: 'Luftqualitaet', usAqi: payload.airQuality.us_aqi, pm10: payload.airQuality.pm10, pm25: payload.airQuality.pm2_5}, {source: 'wttr.in', label: 'Wetter (2. Quelle)', tempC: payload.wttrWeather.current_condition[0].temp_C, feelsLikeC: payload.wttrWeather.current_condition[0].FeelsLikeC, description: payload.wttrWeather.current_condition[0].weatherDesc[0].value, humidity: payload.wttrWeather.current_condition[0].humidity}]}]"
+pipelineTimeoutMs: 60000
 
 stages:
 
-  # ── Stage 1: Geocoding (sequenziell) ──────────────────────────────────────
+  # ── Stage 1: Geocoding (sequential) ─────────────────────────────────────────
   - calls:
       - name: geocode
         endpoint: https://geocoding-api.open-meteo.com
         method: GET
-        path: /v1/search?name=${args.city}&count=1&language=de&format=json
+        path: /v1/search?name=${args.city}&count=1&language=en&format=json
         authType: none
         stopOnError: true
         outputExtract: results.0
 
-  # ── Stage 2: 3 Services parallel ──────────────────────────────────────────
+  # ── Stage 2: 3 weather sources in parallel ───────────────────────────────────
   - parallel: true
     calls:
 
-      # Quelle 1: Open-Meteo — Temperatur, Wind, Luftfeuchte
+      # Source 1: Open-Meteo — temperature, wind, humidity
       - name: weather
         endpoint: https://api.open-meteo.com
         method: GET
@@ -62,19 +62,19 @@ stages:
         stopOnError: true
         outputExtract: current
 
-      # Quelle 2: Open-Meteo Air Quality — Luftqualitätsindex (kein API-Key)
+      # Source 2: Open-Meteo Air Quality — AQI, PM10, PM2.5
       - name: airQuality
         endpoint: https://air-quality-api.open-meteo.com
         method: GET
         path: /v1/air-quality?latitude=${steps.geocode.latitude}&longitude=${steps.geocode.longitude}&current=us_aqi,pm10,pm2_5
         authType: none
-        stopOnError: false   # graceful degradation wenn AQ API nicht erreichbar
+        stopOnError: false   # graceful degradation if AQ API is down
         outputExtract: current
 
-      # Quelle 3: wttr.in — unabhängige 2. Wetterquelle mit Textbeschreibung
+      # Source 3: wttr.in — independent weather source with text description
       - name: wttrWeather
         endpoint: https://wttr.in
         method: GET
         path: /${args.city}?format=j1
         authType: none
-        stopOnError: false   # graceful degradation wenn wttr.in nicht erreichbar
+        stopOnError: false   # graceful degradation if wttr.in is down

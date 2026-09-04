@@ -1,38 +1,39 @@
-# Example: "createOrder" tool — 4 stages mixing sequential and parallel calls.
+# Example: createOrder — 3 stages mixing sequential and parallel calls.
+# Uses the A2D mock REST APIs (https://www.a2d-ai.com) — no real credentials needed.
 #
-# Latency profile (assume each call ~200ms):
+# Pipeline latency (approx):
+#   Stage 1 (sequential)  getToken                        ~200ms
+#   Stage 2 (parallel)    fetchCustomer + checkInventory  ~200ms  ← fired together
+#   Stage 3 (sequential)  createOrder                     ~200ms
+#                                                         ──────
+#   Total                                                 ~600ms (vs ~800ms all-sequential)
 #
-#   Stage 1 (sequential)  authenticate              200ms
-#   Stage 2 (parallel)    customerProfile+inventory 200ms  ← fired together
-#   Stage 3 (sequential)  riskCheck                 200ms  ← uses both stage-2 outputs
-#   Stage 4 (sequential)  createOrder               200ms
-#                                                   ------
-#                         Total                     800ms  (vs 1000ms all-sequential)
+# Input:  { "customerId": "CUST-001", "productSku": "SKU-7842", "quantity": 5 }
+# Output: raw composite with keys: getToken (***), fetchCustomer, checkInventory, createOrder
 #
 # Credential model
 # ─────────────────
-# Supported credential sources:
-#   • Static values — literal strings in token/password/apiKey fields (marked sensitive in GCL).
-#   • Step-derived  — ${steps.<callName>} resolves to a token obtained at runtime, e.g. from
-#                     an auth service call earlier in the pipeline (see Stage 1 + Stage 2 below).
-#   • Passthrough   — forwards the incoming MCP request's Authorization header unchanged.
+# - getToken:       no auth — client credentials in body; token masked in output
+# - fetchCustomer:  bearerToken — ${steps.getToken} resolved from Stage 1
+# - checkInventory: apiKeyHeader — static key in apiKey field
+# - createOrder:    basicAuth — username/password fields
 #
-# ${env.*} expressions are NOT supported and resolve to an empty string.
-# Store secrets as policy configuration properties (marked security:sensitive in GCL);
-# they are encrypted at rest by the Anypoint platform and never appear in logs.
+# NOTE: inputTransform / outputTransform are omitted intentionally.
+# DataWeave compilation at policy init is not supported on Flex Gateway 1.9.x
+# (limitation L-3). Use the raw composite output directly from steps.*
 
 toolName: createOrder
 toolDescription: >
-  Creates an order by authenticating, enriching customer and inventory
-  data in parallel, running a risk check, then creating the order record.
-  Returns the new order ID and status.
+  Creates an order by first obtaining a bearer token from the auth service,
+  then fetching customer profile and inventory data in parallel, and finally
+  submitting the order. Returns orderId and confirmed status.
 
 toolInputSchema: |
   {
     "type": "object",
     "properties": {
-      "customerId": { "type": "string" },
-      "productSku":  { "type": "string" },
+      "customerId": { "type": "string", "description": "Customer ID, e.g. CUST-001" },
+      "productSku":  { "type": "string", "description": "Product SKU, e.g. SKU-7842" },
       "quantity":    { "type": "integer", "minimum": 1 }
     },
     "required": ["customerId", "productSku", "quantity"]
@@ -43,82 +44,48 @@ strictMode: true
 perRequestTimeoutMs: 15000
 pipelineTimeoutMs: 60000
 
-# inputTransform: normalize and upper-case the customer ID before the pipeline.
-inputTransform: "#[{customerId: payload.customerId upper, productSku: payload.productSku, quantity: payload.quantity}]"
-
-# outputTransform: return only the fields the agent needs.
-outputTransform: "#[{orderId: payload.createOrder.data.id, status: payload.createOrder.status, riskApproved: payload.riskCheck}]"
-
 stages:
-  # ── Stage 1: sequential ─────────────────────────────────────────────────────
-  - calls:
-      - name: authenticate
-        endpoint: https://auth.internal/api
-        method: POST
-        path: /token
-        authType: basicAuth
-        username: svc-composer
-        password: "s3cr3t-change-me"   # store in Anypoint Secrets Manager in production
-        bodyTemplate: '{"clientId":"${args.customerId}","scope":"orders"}'
-        stopOnError: true
-        outputExtract: access_token   # ${steps.authenticate} = the token string
-        maskInOutput: true            # hide the token from the MCP tool result
 
-  # ── Stage 2: parallel ───────────────────────────────────────────────────────
+  # ── Stage 1: Auth (sequential, no-auth API) ──────────────────────────────────
+  - calls:
+      - name: getToken
+        endpoint: https://www.a2d-ai.com
+        method: POST
+        path: /api/platform/2992ab1d-933d-47db-b98a-50e3723c31e7/api/auth/token
+        authType: none
+        bodyTemplate: '{"client_id":"mcp-composer-client","client_secret":"demo-secret"}'
+        stopOnError: true
+        outputExtract: access_token
+        maskInOutput: true   # token replaced with "***" in MCP response; flows internally via ${steps.getToken}
+
+  # ── Stage 2: Customer + Inventory in parallel ─────────────────────────────────
   - parallel: true
     calls:
-      - name: customerProfile
-        endpoint: https://crm.internal/api
+      - name: fetchCustomer
+        endpoint: https://www.a2d-ai.com
         method: GET
-        path: /customers/${args.customerId}
+        path: /api/platform/6bb6994c-9dcf-41f6-a314-89e3af12e0d1/api/customers/customers/${args.customerId}
         authType: bearerToken
-        token: "${steps.authenticate}"   # step-derived — resolved from Stage 1 output
+        token: "${steps.getToken}"   # step-derived from Stage 1
         stopOnError: true
-        outputExtract: data
 
-      - name: inventoryCheck
-        endpoint: https://wms.internal/api
+      - name: checkInventory
+        endpoint: https://www.a2d-ai.com
         method: GET
-        path: /inventory/${args.productSku}
+        path: /api/platform/aed7c7a0-88c5-4700-bc86-c302ae789bb0/api/inventory/products/${args.productSku}
         authType: apiKeyHeader
-        headerName: x-api-key
-        apiKey: "wms-api-key-change-me"  # static API key — store in Anypoint Secrets Manager
-        stopOnError: false               # low-stock warning, not fatal
-        outputExtract: available
+        headerName: X-API-Key
+        apiKey: inv-api-key-mcp-composer-2026
+        stopOnError: false   # out-of-stock is a warning, not a fatal error
 
-  # ── Stage 3: sequential ─────────────────────────────────────────────────────
-  - calls:
-      - name: riskCheck
-        endpoint: https://risk.internal/api
-        method: POST
-        path: /evaluate
-        authType: bearerToken
-        token: "${steps.authenticate}"
-        bodyTemplate: |
-          {
-            "customerId":   "${args.customerId}",
-            "customerTier": "${steps.customerProfile.tier}",
-            "sku":          "${args.productSku}",
-            "quantity":     ${args.quantity},
-            "stockLevel":   ${steps.inventoryCheck}
-          }
-        stopOnError: true
-        outputExtract: approved
-
-  # ── Stage 4: sequential ─────────────────────────────────────────────────────
+  # ── Stage 3: Create order (sequential, Basic auth) ────────────────────────────
   - calls:
       - name: createOrder
-        endpoint: https://oms.internal/api
+        endpoint: https://www.a2d-ai.com
         method: POST
-        path: /orders
-        authType: bearerToken
-        token: "${steps.authenticate}"
-        bodyTemplate: |
-          {
-            "customerId":   "${args.customerId}",
-            "customerTier": "${steps.customerProfile.tier}",
-            "sku":          "${args.productSku}",
-            "quantity":     ${args.quantity},
-            "riskApproved": ${steps.riskCheck}
-          }
+        path: /api/platform/45f33fc3-a0d8-433b-895f-c0a578060c97/api/orders/orders
+        authType: basicAuth
+        username: orders-svc
+        password: "s3cr3t-mcp-2026"
+        bodyTemplate: '{"customerId":"${args.customerId}","sku":"${args.productSku}","quantity":${args.quantity}}'
         stopOnError: true
