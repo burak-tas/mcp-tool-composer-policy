@@ -10,7 +10,7 @@ crate-type = ["cdylib", "rlib"]
 
 [package.metadata.anypoint]
 group_id = "96a7526c-e657-42de-919e-0b7bdfab7a80"
-definition_asset_id = { name = "mcp-tool-composer-policy", version = "0.1.0" }
+definition_asset_id = "mcp-tool-composer-policy"
 implementation_asset_id = "mcp-tool-composer-policy-impl"
 
 [dependencies]

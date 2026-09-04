@@ -67,11 +67,11 @@ Stage 3 (sequential)   Orders API      → Basic auth     → creates order
 | TC-09 | Unsupported method (`resources/list`) | JSON-RPC `-32601 Method not found` | `"Method not supported: resources/list"` | ✅ PASS |
 | TC-10 | GET request without SSE Accept header | HTTP 405 | HTTP 405 | ✅ PASS |
 | TC-11 | **Token masking** — `maskInOutput: true` output redacted, pipeline propagates internally | `getToken: "***"` in response, `fetchCustomer` still succeeds | Token masked, downstream Bearer call succeeded, order confirmed | ✅ PASS |
-| TC-12 | **P4A → Anypoint deploy** — `make build-asset-files` + publish to Exchange | Build pipeline completes, policy published to Anypoint Exchange | See §TC-12 below | ⏳ |
+| TC-12 | **P4A → Anypoint deploy** — `make build-asset-files` + publish to Exchange | Build pipeline completes, policy published to Anypoint Exchange | Definition + implementation published; version `0.1.0-20260904191722` | ✅ PASS |
 | TC-13 | Wrong `Content-Type` (not `application/json`) | JSON-RPC `-32600 Invalid Request` | `"Content-Type must be application/json"` | ✅ PASS |
 | TC-14 | `arguments` field not an object | JSON-RPC `-32602 Invalid Params` | `"'arguments' must be a JSON object, got \"bad\""` | ✅ PASS |
 
-**Functional: 13 / 13 PASS | Deploy: ⏳ pending**
+**Functional: 13 / 13 PASS | Deploy: 1 / 1 PASS — 14 / 14 total**
 
 ---
 
@@ -95,13 +95,24 @@ Anypoint Exchange.
 | `definition/gcl.yaml` `bindings` map fixed | Invalid YAML map → sequence error in `build-asset-files` (fixed in prior commit) |
 | `.project.yaml` committed | Build runner couldn't locate project root (fixed in prior commit) |
 
-### Result
+### Result — ✅ PASS
 
-> **⏳ PENDING — awaiting P4A deploy trigger**
->
-> To complete this test case: go to [p4a.ai](https://www.p4a.ai), open the
-> **mcp-tool-composer-policy** deployment, click **Deploy**, and paste the build
-> log result here.
+**Ran manually via `anypoint-cli-v4 pdk policy-project publish` on 2026-09-04.**
+
+Additional fix found during manual run: `definition_asset_id` in Cargo.toml must be a **plain string** (not a TOML table) — `anypoint-cli-v4` (Node.js) reads the TOML table as `[object Object]`, producing invalid asset IDs. `cargo-anypoint` (Rust) handles both forms. Reverted to string form.
+
+| Step | Command | Outcome |
+|---|---|---|
+| 1. Regenerate asset files | `make build-asset-files` | All 6 artifacts generated ✅ |
+| 2. Compile WASM | `cargo build --target wasm32-wasip1 --release` | `mcp_tool_composer.wasm` (release) ✅ |
+| 3. Generate impl GCL | `cargo-anypoint gcl-gen -d mcp-tool-composer-policy -n default ...` | `mcp_tool_composer_implementation.yaml` ✅ |
+| 4. Publish definition | `anypoint-cli-v4 pdk policy-project publish` | Published to Exchange ✅ |
+| 5. Publish implementation | (same command, continues automatically) | Published to Exchange ✅ |
+
+**Exchange asset IDs published:**
+- Definition: `mcp-tool-composer-policy-dev` v`0.1.0-20260904191722`
+- Implementation: `mcp-tool-composer-policy-impl-dev` v`0.1.0-20260904191722`
+- Exchange URL: `https://anypoint.mulesoft.com/exchange/96a7526c-e657-42de-919e-0b7bdfab7a80/mcp-tool-composer-policy-dev`
 
 ---
 
