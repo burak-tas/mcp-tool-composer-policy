@@ -2,11 +2,18 @@ version: "3.3"
 
 services:
   local-flex:
-    image: ${PDK_TEST_FLEX_IMAGE_NAME:-mulesoft/flex-gateway}:${PDK_TEST_FLEX_IMAGE_VERSION:-1.9.3}
+    # Flex/Omni Gateway >= 1.12.0 is required: this terminating policy buffers
+    # request headers+body atomically (into_headers_body_state), which needs the
+    # `flex_enable_stop_iteration` ABI first shipped in 1.12.0 (see #15). 1.9.3
+    # lacks the ABI and the WASM fails at init.
+    image: ${PDK_TEST_FLEX_IMAGE_NAME:-mulesoft/flex-gateway}:${PDK_TEST_FLEX_IMAGE_VERSION:-1.12.0}
     platform: linux/amd64
     environment:
       LOG_LEVEL: debug
       FLEX_LOG_LEVEL: 7
+      # Physical ceiling for the atomically-buffered request/response (default
+      # 1 MiB). Keep at or above the policy's maxRequestBytes / maxResponseBytes.
+      FLEX_DOWNSTREAM_CONNECTION_BUFFER_LIMIT_BYTES: "1048576"
     ports:
       - 8081:8081
     volumes:

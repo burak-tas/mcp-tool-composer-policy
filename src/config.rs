@@ -209,6 +209,15 @@ pub struct PolicyConfig {
     pub per_request_timeout_ms: u32,
     /// Global wall-clock cap for the entire pipeline (all stages combined).
     pub pipeline_timeout_ms: u32,
+    /// Maximum size (bytes) of the incoming MCP request body. A larger body is
+    /// rejected before parsing. Bounds the atomically-buffered request (#16).
+    pub max_request_bytes: usize,
+    /// Maximum size (bytes) of any single downstream response body. A larger
+    /// response fails that call with a tool-execution error (#16).
+    pub max_response_bytes: usize,
+    /// Maximum size (bytes) of the final serialized MCP tool result. A larger
+    /// result fails the call with a tool-execution error (#16).
+    pub max_result_bytes: usize,
 }
 
 impl PolicyConfig {
@@ -236,6 +245,17 @@ impl PolicyConfig {
 
         // Global pipeline deadline: default 60 s, max 600 s (same ceiling as per-call).
         let pipeline_timeout_ms = clamp_u32(raw.pipeline_timeout_ms, 1_000, 600_000, 60_000);
+
+        // Payload-size caps (#16). Default 1 MiB each — aligned with the Omni
+        // downstream connection buffer default (FLEX_DOWNSTREAM_CONNECTION_
+        // BUFFER_LIMIT_BYTES), which is the physical ceiling the atomically
+        // buffered request must fit under. Clamped to [1 KiB, 100 MiB]: a value
+        // above the runtime's connection-buffer limit can never actually be
+        // buffered, but we still accept it so operators who raise that env var
+        // are not silently capped lower by the policy.
+        let max_request_bytes = clamp_usize(raw.max_request_bytes, 1_024, 104_857_600, 1_048_576);
+        let max_response_bytes = clamp_usize(raw.max_response_bytes, 1_024, 104_857_600, 1_048_576);
+        let max_result_bytes = clamp_usize(raw.max_result_bytes, 1_024, 104_857_600, 1_048_576);
 
         let mut all_call_names: Vec<String> = Vec::new();
         let mut total_calls: usize = 0;
@@ -350,6 +370,9 @@ impl PolicyConfig {
             stages,
             per_request_timeout_ms,
             pipeline_timeout_ms,
+            max_request_bytes,
+            max_response_bytes,
+            max_result_bytes,
         })
     }
 
@@ -455,6 +478,10 @@ fn normalize_path(s: &str) -> String {
 
 fn clamp_u32(v: Option<i64>, min: i64, max: i64, default: i64) -> u32 {
     v.unwrap_or(default).clamp(min, max) as u32
+}
+
+fn clamp_usize(v: Option<i64>, min: i64, max: i64, default: i64) -> usize {
+    v.unwrap_or(default).clamp(min, max) as usize
 }
 
 // ---------------------------------------------------------------------------

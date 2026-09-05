@@ -98,14 +98,31 @@ fn origin_allowed(origin: &str, allowlist: &[String]) -> bool {
 // ---------------------------------------------------------------------------
 
 async fn request_filter(
-    request: RequestHeadersState,
+    request: RequestState,
     policy: Rc<PolicyConfig>,
     raw_config: Rc<Config>,
     service_map: Rc<ServiceMap>,
     client: HttpClient,
 ) -> Flow<()> {
-    let path = request.path();
-    let method = request.method().to_ascii_uppercase();
+    // This is a TERMINATING policy — it answers tools/call itself via
+    // Flow::Break. Buffer request headers + body ATOMICALLY in one transition
+    // (#15): the sequential into_headers_state().await → into_body_state().await
+    // pattern releases the headers to Envoy's router on the first await, which
+    // begins proxying upstream in parallel, so a synthetic Flow::Break can lose
+    // the race to an upstream response. into_headers_body_state() holds the
+    // request in the filter (never forwarded) so our response always wins. It
+    // requires the `enable_stop_iteration` feature + a runtime with the
+    // `flex_enable_stop_iteration` ABI (Flex/Omni Gateway >= 1.12.0).
+    let state = request.into_headers_body_state().await;
+    let handler = state.handler();
+
+    // The combined headers+body state exposes only pseudo-headers (no
+    // .method()/.path() convenience accessors), so read them directly.
+    let path = handler.header(":path").unwrap_or_else(|| "/".to_string());
+    let method = handler
+        .header(":method")
+        .unwrap_or_default()
+        .to_ascii_uppercase();
 
     let bare = path.split_once('?').map(|(p, _)| p).unwrap_or(&path);
     if !bare.starts_with(&policy.mcp_endpoint) {
@@ -128,7 +145,7 @@ async fn request_filter(
     // allowlist is configured; a request with no Origin header (a non-browser
     // client) is allowed, since the rebinding threat is browser-only.
     if !policy.allowed_origins.is_empty() {
-        if let Some(origin) = request.handler().header("origin") {
+        if let Some(origin) = handler.header("origin") {
             if !origin_allowed(&origin, &policy.allowed_origins) {
                 return send_error(403, "Origin not allowed");
             }
@@ -136,7 +153,7 @@ async fn request_filter(
     }
 
     // Validate Content-Type for POST — must be application/json.
-    let content_type = request.handler().header("content-type").unwrap_or_default();
+    let content_type = handler.header("content-type").unwrap_or_default();
     if !content_type.contains("application/json") {
         return send_json_rpc(
             200,
@@ -151,7 +168,7 @@ async fn request_filter(
     // Accept, when present, must accept application/json — the only media type
     // this server emits. An absent Accept is tolerated (many non-browser MCP
     // clients omit it); a present-but-incompatible Accept is a 400 Bad Request.
-    if let Some(accept) = request.handler().header("accept") {
+    if let Some(accept) = handler.header("accept") {
         if !accepts_json(&accept) {
             return send_json_rpc(
                 400,
@@ -164,15 +181,39 @@ async fn request_filter(
         }
     }
 
-    // Capture headers needed after the request body is consumed:
+    // Headers needed after the body is read:
     // - Authorization (forwarded for passthrough auth calls)
     // - MCP-Protocol-Version (validated post-parse, since `initialize` is exempt)
-    let incoming_auth: Option<String> = request.handler().header("authorization");
-    let requested_protocol_version: Option<String> =
-        request.handler().header("mcp-protocol-version");
+    let incoming_auth: Option<String> = handler.header("authorization");
+    let requested_protocol_version: Option<String> = handler.header("mcp-protocol-version");
 
-    let body_state = request.into_body_state().await;
-    let body = body_state.handler().body();
+    // The body was buffered atomically above. `contains_body()` is false for a
+    // bodyless request (shouldn't reach here — only POST gets this far — but be
+    // defensive rather than panic).
+    let body = if state.contains_body() {
+        handler.body()
+    } else {
+        Vec::new()
+    };
+
+    // Payload-size cap (#16): reject an oversized request body before parsing so
+    // the buffered request can't drive unbounded downstream work. The atomic
+    // buffer itself is physically bounded by FLEX_DOWNSTREAM_CONNECTION_BUFFER_
+    // LIMIT_BYTES (default 1 MiB); this is the explicit, configurable cap on top.
+    if body.len() > policy.max_request_bytes {
+        return send_json_rpc(
+            200,
+            &error_response(
+                None,
+                INVALID_REQUEST,
+                format!(
+                    "request body of {} bytes exceeds limit of {} bytes",
+                    body.len(),
+                    policy.max_request_bytes
+                ),
+            ),
+        );
+    }
 
     let rpc: JsonRpcRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
@@ -419,6 +460,19 @@ async fn handle_tools_call(
                     ),
                 );
             }
+            // Payload-size cap (#16): a downstream response exceeding the
+            // configured limit fails the call. The message names the limit,
+            // never the (potentially sensitive) oversized body.
+            Err(PipelineError::ResponseTooLarge { call, limit, .. }) => {
+                return send_json_rpc(
+                    200,
+                    &tool_error_response(
+                        id,
+                        format!("call '{}' response exceeded {} bytes", call, limit),
+                        "response_too_large",
+                    ),
+                );
+            }
             // Injection-safe construction (#11): an unresolved/malformed expression
             // aborts the call instead of sending a request with a hole in it. The
             // message carries only the expression text, never a resolved value.
@@ -464,9 +518,27 @@ async fn handle_tools_call(
         }
     };
 
+    // Payload-size cap (#16): bound the final serialized result so a pipeline
+    // that composes many/large responses can't emit an unbounded MCP result.
+    let final_text = final_value.to_string();
+    if final_text.len() > policy.max_result_bytes {
+        return send_json_rpc(
+            200,
+            &tool_error_response(
+                id,
+                format!(
+                    "result exceeded {} bytes ({} bytes produced)",
+                    policy.max_result_bytes,
+                    final_text.len()
+                ),
+                "result_too_large",
+            ),
+        );
+    }
+
     let content = json!([{
         "type": "text",
-        "text": final_value.to_string(),
+        "text": final_text,
     }]);
     send_json_rpc(
         200,
@@ -555,7 +627,7 @@ pub async fn configure(
     let policy = Rc::new(policy);
     let raw_config = Rc::new(raw);
 
-    let filter = on_request(move |request: RequestHeadersState, client: HttpClient| {
+    let filter = on_request(move |request: RequestState, client: HttpClient| {
         let policy = policy.clone();
         let raw_config = raw_config.clone();
         let service_map = service_map.clone();
