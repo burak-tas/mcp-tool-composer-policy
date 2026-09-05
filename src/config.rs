@@ -199,6 +199,9 @@ impl Stage {
 pub struct PolicyConfig {
     pub mcp_endpoint: String,
     pub strict_mode: bool,
+    /// Allowlist of permitted HTTP `Origin` header values (DNS-rebinding
+    /// protection). Empty = Origin is not validated. `"*"` allows any origin.
+    pub allowed_origins: Vec<String>,
     pub tool_name: String,
     pub tool_description: String,
     pub tool_input_schema: Value,
@@ -326,9 +329,21 @@ impl PolicyConfig {
             stages.push(stage);
         }
 
+        // Normalize the Origin allowlist: trim, drop empties. Empty vec means
+        // "do not validate Origin".
+        let allowed_origins: Vec<String> = raw
+            .allowed_origins
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
         Ok(Self {
             mcp_endpoint: normalize_mcp_path(raw.mcp_endpoint.as_deref().unwrap_or("/mcp")),
             strict_mode: raw.strict_mode.unwrap_or(true),
+            allowed_origins,
             tool_name,
             tool_description: raw.tool_description.clone(),
             tool_input_schema,

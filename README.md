@@ -46,6 +46,7 @@ One policy instance = one MCP tool. To expose multiple composed tools, apply the
 | `pipelineTimeoutMs` | integer | | 60000 | Global wall-clock deadline for the entire pipeline in ms (1000–600000) |
 | `mcpEndpoint` | string | | `/mcp` | Path for the MCP endpoint |
 | `strictMode` | boolean | | `true` | Reject non-MCP requests with 404 |
+| `allowedOrigins` | array | | — | Origin allowlist for DNS-rebinding protection; empty/unset = no `Origin` validation (see [Transport compliance](#transport-compliance)) |
 
 ### Stage configuration
 
@@ -161,6 +162,38 @@ key, a malformed `${…}`, or an unsupported prefix such as `${env.*}` — fails
 with an `isError:true` result naming the offending expression (never the resolved value).
 It is never silently substituted with an empty string.
 
+## Transport compliance
+
+The policy implements the MCP **Streamable-HTTP** transport as the MCP *server*:
+
+- **Protocol-version negotiation.** On `initialize`, the server reads the client's
+  `params.protocolVersion` and echoes it when supported (`2025-06-18`, `2025-03-26`,
+  `2024-11-05`); when the requested version is unsupported or absent, it responds with
+  its **preferred (latest)** version — `2025-06-18` — and the client decides whether to
+  proceed. It never echoes an unsupported version back.
+- **`MCP-Protocol-Version` header.** Required on every request *after* initialization.
+  A request naming an unsupported version is rejected with **`400 Bad Request`**; an
+  absent header falls back to the spec default (`2025-03-26`) rather than erroring.
+  `initialize` itself is exempt (the client cannot know the version yet).
+- **`Origin` validation (DNS-rebinding protection).** When `allowedOrigins` is
+  configured, a request whose `Origin` header is not listed is rejected with
+  **`403 Forbidden`**. `"*"` allows any Origin. A request with **no** `Origin` header
+  (a non-browser client) is always allowed — the rebinding threat is browser-only.
+  When `allowedOrigins` is empty/unset, `Origin` is not validated (pair with a gateway
+  CORS/Origin policy if you need it enforced unconditionally).
+- **`Accept` header.** When present on a POST, it must accept `application/json` (the
+  only media type this server emits); otherwise the request is **`400 Bad Request`**.
+  An absent `Accept` is tolerated. Media ranges are tokenized properly, so `*/*` and
+  `application/*` match and `application/json-patch+json` does not false-match.
+- **`Content-Type`.** POST bodies must be `application/json`.
+- **GET / DELETE → `405 Method Not Allowed`** (with `Allow: POST`). This server returns
+  every tool result **synchronously** on the POST response and offers no server-initiated
+  SSE stream, so — per the transport spec — a GET is `405`, not a stub event-stream that
+  closes immediately.
+- **Stateless — no session.** The server never issues an `Mcp-Session-Id`; each
+  `tools/call` is independent, so clients never need to echo a session header. (Session
+  management is optional in the transport for a synchronous request/response server.)
+
 ## Policy ordering
 
 Apply this policy as the outermost processing layer. Recommended chain:
@@ -189,7 +222,7 @@ Apply this policy as the outermost processing layer. Recommended chain:
 | L-2 | Completed stages are **not rolled back** on failure — design mutating pipelines with idempotency keys or compensating actions |
 | L-3 | `outputTransform` with object-literal DataWeave syntax (`#[{...}]`) is not supported in Flex 1.9.x (PEL limitation) |
 | L-4 | One policy instance = one MCP tool; apply multiple times for multiple tools |
-| L-5 | Protocol version is fixed at `2024-11-05` (HTTP+SSE transport) |
+| L-5 | No server-initiated streams: GET is `405` (no SSE channel); tool results are returned synchronously on the POST response (see [Transport compliance](#transport-compliance)) |
 
 ## Local development
 

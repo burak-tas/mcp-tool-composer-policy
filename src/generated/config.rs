@@ -53,6 +53,8 @@ pub struct Stages0Config {
 }
 #[derive(Deserialize, Clone, Debug)]
 pub struct Config {
+    #[serde(alias = "allowedOrigins")]
+    pub allowed_origins: Option<Vec<String>>,
     #[serde(
         alias = "inputTransform",
         default,
