@@ -4,13 +4,30 @@ A [Omni Gateway PDK](https://docs.mulesoft.com/gateway/latest/policies-pdk-overv
 
 ## When to use this policy
 
-| Scenario | Policy to use |
-|---|---|
-| One MCP tool → one REST API call | **MCP Transcoding** (built-in) |
-| **One MCP tool → multiple REST APIs in sequence or parallel** | **This policy** |
-| Multiple MCP tools, each with their own backend | Apply this policy once per tool, or use a router pattern |
+This policy exposes **one MCP tool** backed by a **multi-step pipeline** of backend calls.
+Reach for it whenever a single native, one-call mapping isn't enough.
 
-The key differentiator is **multi-step composition**: a single `tools/call` request drives a chain of REST API calls across multiple services, where later stages can reference outputs from earlier ones via `${steps.<name>}` expressions.
+| Your backend / scenario | Native MuleSoft option | Use **this policy** when… |
+|---|---|---|
+| One MCP tool → one REST call | **MCP Bridge** — an API Manager *instance* (`Agent & Tool Instances → Add → MCP Bridge`) that maps one HTTP *Method + Resource* to one tool | you need **≥ 2 backend calls** per tool — sequential and/or parallel stages where later stages consume earlier outputs via `${steps.<name>}` |
+| One MCP tool → several REST calls (in sequence and/or parallel) | *none* — the native bridge has no multi-step composition | **always** — multi-step composition is the reason this policy exists |
+| Expose a **GraphQL** backend as an MCP tool | *no GraphQL **transcoding** built-in* — MuleSoft's GraphQL policies (Access Control, Operation Limits, Schema Validation, Static Query Complexity, Introspection Control) only **govern an existing GraphQL API** | you point a call's `bodyTemplate` at the GraphQL endpoint (a single `POST` carrying `query` + `variables`) and optionally compose the result with other calls |
+| Expose an **OData** backend as an MCP tool | *no OData built-in on the gateway at all* | you drive the OData query through `path` / query-string interpolation (`$filter`, `$select`, …) and normalise the response into the tool result |
+| Multiple MCP tools, each with its own backend | apply the MCP Bridge / this policy per tool | apply this policy once per tool at distinct `mcpEndpoint` paths, or front it with a router |
+
+The key differentiator is **multi-step composition**: a single `tools/call` request drives a
+chain of backend calls across multiple services, where later stages reference outputs from
+earlier ones via `${steps.<name>}` expressions.
+
+> **A note on "transcoding" terminology.** MuleSoft's native REST→MCP mechanism is the
+> **MCP Bridge** *instance* in API Manager (immutable once deployed — changing its tools
+> means creating a new instance and cutting over), not a gateway policy; its companion
+> gateway policies (MCP Support, MCP Schema Validation, MCP Tool Mapping, …) govern an MCP
+> server rather than perform the mapping. There is **no** GraphQL- or OData-*transcoding*
+> built-in on Omni/Flex Gateway — the GraphQL policies only protect an already-GraphQL API,
+> and OData is not a shipped gateway capability. So for anything past a single REST call —
+> including fronting a GraphQL or OData backend as one MCP tool — this custom policy is the
+> composition layer.
 
 ## Overview
 
