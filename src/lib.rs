@@ -10,6 +10,7 @@ mod dw;
 mod generated;
 mod jsonrpc;
 mod pipeline;
+mod schema;
 
 #[cfg(test)]
 mod tests;
@@ -83,7 +84,11 @@ async fn request_filter(
     if !content_type.contains("application/json") {
         return send_json_rpc(
             200,
-            &error_response(None, INVALID_REQUEST, "Content-Type must be application/json"),
+            &error_response(
+                None,
+                INVALID_REQUEST,
+                "Content-Type must be application/json",
+            ),
         );
     }
 
@@ -212,10 +217,7 @@ async fn handle_tools_call(
             &error_response(
                 id,
                 INVALID_PARAMS,
-                format!(
-                    "Unknown tool '{}'. Available: '{}'",
-                    name, policy.tool_name
-                ),
+                format!("Unknown tool '{}'. Available: '{}'", name, policy.tool_name),
             ),
         );
     }
@@ -235,79 +237,102 @@ async fn handle_tools_call(
         }
     };
 
-    // Validate required fields declared in toolInputSchema before running any transform.
-    if let Some(err_msg) = validate_args(&raw_args, &policy.tool_input_schema) {
-        return send_json_rpc(200, &error_response(id, INVALID_PARAMS, err_msg));
+    // Validate arguments against the full toolInputSchema (types, enums,
+    // bounds, required, additionalProperties) BEFORE running any transform or
+    // dispatching the pipeline (#12). The error is sanitized — it names the
+    // failing path and constraint, never the offending value.
+    if let Err(err_msg) = schema::validate(&raw_args, &policy.tool_input_schema) {
+        return send_json_rpc(
+            200,
+            &error_response(id, INVALID_PARAMS, format!("invalid arguments — {err_msg}")),
+        );
     }
 
     // 1. Apply inputTransform — reshape args before pipeline.
     let pipeline_args = match dw::eval_transform(raw_config.input_transform.as_ref(), &raw_args) {
         Ok(v) => v,
         Err(e) => {
+            // The DataWeave error `e` can echo the transform's input payload —
+            // keep the detail server-side and return a generic message so
+            // caller input (or credentials in it) never leaks (#13).
+            logger::error!("[{}] inputTransform failed: {}", POLICY_NAME, e);
             return send_json_rpc(
                 200,
-                &tool_error_response(id, format!("inputTransform failed: {e}"), "transform_error"),
+                &tool_error_response(id, "inputTransform failed", "transform_error"),
             );
         }
     };
 
     // 2. Execute pipeline.
-    let pipeline_result = match pipeline::run_pipeline(
-        policy,
-        service_map,
-        &pipeline_args,
-        client,
-        incoming_auth,
-    )
-    .await
-    {
-        Ok(r) => r,
-        // Downstream execution failures → CallToolResult with isError:true so
-        // MCP clients and models can inspect and recover.
-        Err(PipelineError::HttpStatus { call, status }) => {
-            return send_json_rpc(
-                200,
-                &tool_error_response(
-                    id,
-                    format!("call '{}' returned HTTP {}", call, status),
-                    "http_error",
-                ),
-            );
-        }
-        Err(PipelineError::Transport { call, message }) => {
-            logger::error!("[{}] transport error on '{}': {}", POLICY_NAME, call, message);
-            return send_json_rpc(
-                200,
-                &tool_error_response(
-                    id,
-                    format!("call '{}' transport error", call),
-                    "transport_error",
-                ),
-            );
-        }
-        Err(PipelineError::BadJson { call, .. }) => {
-            return send_json_rpc(
-                200,
-                &tool_error_response(
-                    id,
-                    format!("call '{}' returned non-JSON response", call),
-                    "parse_error",
-                ),
-            );
-        }
-        Err(PipelineError::Timeout { call }) => {
-            return send_json_rpc(
-                200,
-                &tool_error_response(id, format!("call '{}' timed out", call), "timeout"),
-            );
-        }
-        Err(PipelineError::GlobalTimeout) => {
-            return send_json_rpc(
-                200,
-                &tool_error_response(id, "pipeline exceeded global deadline", "timeout"),
-            );
-        }
-    };
+    let pipeline_result =
+        match pipeline::run_pipeline(policy, service_map, &pipeline_args, client, incoming_auth)
+            .await
+        {
+            Ok(r) => r,
+            // Downstream execution failures → CallToolResult with isError:true so
+            // MCP clients and models can inspect and recover.
+            Err(PipelineError::HttpStatus { call, status }) => {
+                return send_json_rpc(
+                    200,
+                    &tool_error_response(
+                        id,
+                        format!("call '{}' returned HTTP {}", call, status),
+                        "http_error",
+                    ),
+                );
+            }
+            Err(PipelineError::Transport { call, message }) => {
+                logger::error!(
+                    "[{}] transport error on '{}': {}",
+                    POLICY_NAME,
+                    call,
+                    message
+                );
+                return send_json_rpc(
+                    200,
+                    &tool_error_response(
+                        id,
+                        format!("call '{}' transport error", call),
+                        "transport_error",
+                    ),
+                );
+            }
+            Err(PipelineError::BadJson { call, .. }) => {
+                return send_json_rpc(
+                    200,
+                    &tool_error_response(
+                        id,
+                        format!("call '{}' returned non-JSON response", call),
+                        "parse_error",
+                    ),
+                );
+            }
+            // Injection-safe construction (#11): an unresolved/malformed expression
+            // aborts the call instead of sending a request with a hole in it. The
+            // message carries only the expression text, never a resolved value.
+            Err(PipelineError::Interpolation { call, message }) => {
+                return send_json_rpc(
+                    200,
+                    &tool_error_response(
+                        id,
+                        format!("call '{}' could not be built: {}", call, message),
+                        "invalid_argument",
+                    ),
+                );
+            }
+            Err(PipelineError::Timeout { call }) => {
+                return send_json_rpc(
+                    200,
+                    &tool_error_response(id, format!("call '{}' timed out", call), "timeout"),
+                );
+            }
+            Err(PipelineError::GlobalTimeout) => {
+                return send_json_rpc(
+                    200,
+                    &tool_error_response(id, "pipeline exceeded global deadline", "timeout"),
+                );
+            }
+        };
 
     // 3. Apply outputTransform — shape the composite result for the MCP client.
     let final_value = match dw::eval_transform(
@@ -316,13 +341,13 @@ async fn handle_tools_call(
     ) {
         Ok(v) => v,
         Err(e) => {
+            // The DataWeave error `e` can echo the composite pipeline output,
+            // which may carry un-masked ${steps.*} credentials — keep the
+            // detail server-side and return a generic message (#13).
+            logger::error!("[{}] outputTransform failed: {}", POLICY_NAME, e);
             return send_json_rpc(
                 200,
-                &tool_error_response(
-                    id,
-                    format!("outputTransform failed: {e}"),
-                    "transform_error",
-                ),
+                &tool_error_response(id, "outputTransform failed", "transform_error"),
             );
         }
     };
@@ -335,31 +360,6 @@ async fn handle_tools_call(
         200,
         &success_response(id, json!({ "content": content, "isError": false })),
     )
-}
-
-// ---------------------------------------------------------------------------
-// Argument validation (JSON Schema subset: required array)
-// ---------------------------------------------------------------------------
-
-/// Check `required` fields from the toolInputSchema. Returns `Some(error_message)`
-/// when required fields are missing, `None` when valid.
-fn validate_args(args: &Value, schema: &Value) -> Option<String> {
-    let required = match schema.get("required") {
-        Some(Value::Array(arr)) => arr,
-        _ => return None,
-    };
-
-    let missing: Vec<&str> = required
-        .iter()
-        .filter_map(|v| v.as_str())
-        .filter(|field| args.get(field).is_none())
-        .collect();
-
-    if missing.is_empty() {
-        None
-    } else {
-        Some(format!("missing required argument(s): {}", missing.join(", ")))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -436,9 +436,7 @@ pub async fn configure(
         let policy = policy.clone();
         let raw_config = raw_config.clone();
         let service_map = service_map.clone();
-        async move {
-            request_filter(request, policy, raw_config, service_map, client).await
-        }
+        async move { request_filter(request, policy, raw_config, service_map, client).await }
     });
 
     launcher.launch(filter).await?;

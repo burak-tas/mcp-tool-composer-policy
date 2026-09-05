@@ -4,7 +4,9 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use serde_json::Value;
 
-use crate::generated::config::{Calls0Config as CallConfig, Config, Headers0Config as HeadersConfig};
+use crate::generated::config::{
+    Calls0Config as CallConfig, Config, Headers0Config as HeadersConfig,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -70,7 +72,10 @@ pub enum AuthConfig {
     /// Static or ${steps.*}-resolved Basic credentials.
     Basic { username: String, password: String },
     /// Static or ${steps.*}-resolved API key header.
-    ApiKey { header_name: String, api_key: String },
+    ApiKey {
+        header_name: String,
+        api_key: String,
+    },
     /// All auth comes from the `headers` array (fully interpolated).
     CustomHeaders,
 }
@@ -113,7 +118,10 @@ impl AuthConfig {
                         "call '{call_name}': authType=apiKeyHeader requires non-empty 'apiKey'"
                     ))
                 })?;
-                Ok(Self::ApiKey { header_name, api_key })
+                Ok(Self::ApiKey {
+                    header_name,
+                    api_key,
+                })
             }
             "customHeaders" => Ok(Self::CustomHeaders),
             other => Err(ConfigError::UnknownAuthType(
@@ -221,12 +229,10 @@ impl PolicyConfig {
                 .map_err(|e| ConfigError::InvalidInputSchema(e.to_string()))?,
         };
 
-        let per_request_timeout_ms =
-            clamp_u32(raw.per_request_timeout_ms, 100, 600_000, 30_000);
+        let per_request_timeout_ms = clamp_u32(raw.per_request_timeout_ms, 100, 600_000, 30_000);
 
         // Global pipeline deadline: default 60 s, max 600 s (same ceiling as per-call).
-        let pipeline_timeout_ms =
-            clamp_u32(raw.pipeline_timeout_ms, 1_000, 600_000, 60_000);
+        let pipeline_timeout_ms = clamp_u32(raw.pipeline_timeout_ms, 1_000, 600_000, 60_000);
 
         let mut all_call_names: Vec<String> = Vec::new();
         let mut total_calls: usize = 0;
@@ -265,32 +271,42 @@ impl PolicyConfig {
             // Validate: parallel calls must not reference sibling outputs in any
             // interpolated field (path, body, auth credentials, custom headers).
             if parallel {
-                let sibling_names: Vec<&str> =
-                    call_defs.iter().map(|c| c.name.as_str()).collect();
+                let sibling_names: Vec<&str> = call_defs.iter().map(|c| c.name.as_str()).collect();
                 for call in &call_defs {
                     for sibling in &sibling_names {
                         if call.name == *sibling {
                             continue;
                         }
                         let ref_pat = format!("${{steps.{}", sibling);
-                        let mut bad_field: Option<&str> = None;
 
-                        if call.path.contains(&ref_pat) {
-                            bad_field = Some("path");
-                        } else if call.body_template.as_deref().map(|t| t.contains(&ref_pat)).unwrap_or(false) {
-                            bad_field = Some("bodyTemplate");
-                        } else if let Some(cred) = call.auth.raw_credential() {
-                            if cred.contains(&ref_pat) {
-                                bad_field = Some("auth credential");
-                            }
+                        // Check EVERY interpolated field independently (#11) — a
+                        // call may carry both a credential and a header, so these
+                        // are not mutually exclusive.
+                        let bad_field: Option<&str> = if call.path.contains(&ref_pat) {
+                            Some("path")
+                        } else if call
+                            .body_template
+                            .as_deref()
+                            .map(|t| t.contains(&ref_pat))
+                            .unwrap_or(false)
+                        {
+                            Some("bodyTemplate")
+                        } else if call
+                            .auth
+                            .raw_credential()
+                            .map(|cred| cred.contains(&ref_pat))
+                            .unwrap_or(false)
+                        {
+                            Some("auth credential")
+                        } else if call
+                            .extra_headers
+                            .iter()
+                            .any(|(_, hv)| hv.contains(&ref_pat))
+                        {
+                            Some("header value")
                         } else {
-                            for (_, hv) in &call.extra_headers {
-                                if hv.contains(&ref_pat) {
-                                    bad_field = Some("header value");
-                                    break;
-                                }
-                            }
-                        }
+                            None
+                        };
 
                         if let Some(field) = bad_field {
                             return Err(ConfigError::Invalid(format!(
@@ -450,7 +466,9 @@ mod tests {
 
     #[test]
     fn test_auth_bearer_resolved() {
-        let auth = AuthConfig::Bearer { token: "${steps.getToken}".into() };
+        let auth = AuthConfig::Bearer {
+            token: "${steps.getToken}".into(),
+        };
         let (k, v) = auth.auth_header_resolved("tok-abc").unwrap();
         assert_eq!(k, "authorization");
         assert_eq!(v, "Bearer tok-abc");
@@ -458,7 +476,10 @@ mod tests {
 
     #[test]
     fn test_auth_basic_encodes() {
-        let auth = AuthConfig::Basic { username: "user".into(), password: "pass".into() };
+        let auth = AuthConfig::Basic {
+            username: "user".into(),
+            password: "pass".into(),
+        };
         let (k, v) = auth.auth_header_resolved("").unwrap();
         assert_eq!(k, "authorization");
         assert!(v.starts_with("Basic "));

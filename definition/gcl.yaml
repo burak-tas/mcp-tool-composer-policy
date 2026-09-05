@@ -132,7 +132,12 @@ spec:
                   type: string
                   description: >
                     JSON body template. Supports ${args.*} / ${steps.*} expressions.
-                    Omit for GET/DELETE.
+                    Omit for GET/DELETE. Marked sensitive: a body template may
+                    interpolate credentials (${steps.*} auth tokens) or PII, so
+                    it must not be surfaced in logs or diagnostics.
+                  "@context":
+                    "@characteristics":
+                      - "security:sensitive"
 
                 authType:
                   type: string
@@ -197,7 +202,14 @@ spec:
                         description: Header name.
                       value:
                         type: string
-                        description: Header value (supports ${...} expressions).
+                        description: >
+                          Header value (supports ${...} expressions). Marked
+                          sensitive: when authType=customHeaders these carry all
+                          auth materials (Authorization, API keys), so a value
+                          must not be surfaced in logs or diagnostics.
+                        "@context":
+                          "@characteristics":
+                            - "security:sensitive"
                     required:
                       - name
                       - value

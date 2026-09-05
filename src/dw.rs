@@ -49,8 +49,8 @@ fn dw_to_json(v: DwValue) -> Value {
         }
         DwValue::String(s) => Value::String(s),
         DwValue::Array(arr) => Value::Array(arr.into_iter().map(dw_to_json).collect()),
-        DwValue::Object(obj) => Value::Object(
-            obj.into_iter().map(|(k, v)| (k, dw_to_json(v))).collect(),
-        ),
+        DwValue::Object(obj) => {
+            Value::Object(obj.into_iter().map(|(k, v)| (k, dw_to_json(v))).collect())
+        }
     }
 }

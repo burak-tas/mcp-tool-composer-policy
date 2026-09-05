@@ -107,7 +107,30 @@ Supported credential sources:
 - **Step-derived** — `${steps.<callName>}` resolves to a value obtained at runtime (e.g. a token from an earlier auth call). Use `maskInOutput: true` on the auth call to hide the token from the MCP result while still forwarding it internally.
 - **Passthrough** — forwards the incoming MCP request's `Authorization` header unchanged.
 
-**`${env.*}` expressions are not supported** and resolve to an empty string. Do not use them.
+**`${env.*}` expressions are not supported.** Referencing one is a hard error — the call fails rather than silently sending a request with a hole in it.
+
+### Credential confidentiality
+
+Credentials are marked `security:sensitive` in the policy schema (`token`, `password`,
+`apiKey`, `bodyTemplate`, and each custom header `value`), and the policy treats them as
+confidential end-to-end:
+
+- **Sent upstream, never returned.** A credential is attached to the outbound call's auth
+  header (`Bearer`, `Basic`, the API-key header, or a custom header) but is never copied
+  into the MCP response. If a step *fetches* a token (`${steps.<authCall>}`), set
+  `maskInOutput: true` on that auth call so its value renders as `"***"` in the result
+  while still resolving internally for downstream calls.
+- **Errors are generic.** Transform (`inputTransform`/`outputTransform`) and pipeline
+  failures return a fixed message; the underlying DataWeave/transport detail — which can
+  echo the payload or a resolved credential — is logged server-side only, never sent to
+  the client.
+
+**Passthrough trust boundary.** `authType: passthrough` forwards the incoming MCP request's
+`Authorization` header **verbatim** to the configured upstream. Only use it on calls whose
+`endpoint` you trust with the caller's credential — the gateway is handing that bearer/token
+to the backend as-is. Combine with a JWT/OAuth policy *in front* of this one (see
+[Policy ordering](#policy-ordering)) so the forwarded credential is one you have already
+validated, and never point a passthrough call at an untrusted or third-party host.
 
 ### Expression syntax
 
@@ -115,6 +138,28 @@ Supported credential sources:
 - `${steps.<callName>}` — full response body of a previous call
 - `${steps.<callName>.field.nested}` — dot-notation path into a previous response
 - `outputExtract: "data.id"` — extract a sub-path from a call's response into `${steps.<name>}`
+
+### Injection-safe construction
+
+Every caller-controlled value is encoded for the exact position it lands in, so a
+malicious MCP argument can only ever be **data**, never request structure:
+
+- **URL (`path`, incl. query string)** — substituted values are percent-encoded
+  (RFC 3986). `path: /v1/search?name=${args.city}&count=1` with `city="Berlin&count=100"`
+  sends `name=Berlin%26count%3D100` — it cannot inject a second query parameter, and
+  a value like `../../admin` cannot traverse the path.
+- **`bodyTemplate` (JSON)** — interpolation is JSON-position aware. A value inside a
+  string (`"${args.customerId}"`) is emitted as escaped string content; a value in a
+  bare position (`${args.quantity}`) is emitted as a complete JSON token. A `"` or `\`
+  in the value cannot break out and inject sibling fields, so the hybrid convention
+  (quote strings, leave numbers/objects bare) stays correct **and** safe.
+- **Headers / credentials** — CR/LF are stripped from substituted values to prevent
+  header injection.
+
+**Strict resolution.** An expression that cannot be resolved — a missing `args`/`steps`
+key, a malformed `${…}`, or an unsupported prefix such as `${env.*}` — fails the call
+with an `isError:true` result naming the offending expression (never the resolved value).
+It is never silently substituted with an empty string.
 
 ## Policy ordering
 
