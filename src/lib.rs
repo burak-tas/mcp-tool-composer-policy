@@ -11,6 +11,9 @@ mod generated;
 mod jsonrpc;
 mod pipeline;
 
+#[cfg(test)]
+mod tests;
+
 use std::collections::HashMap;
 use std::rc::Rc;
 
