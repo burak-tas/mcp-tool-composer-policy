@@ -1014,4 +1014,263 @@ mod tests {
         let response = ping_with_origin(&default_config(), Some("https://evil.example"));
         assert_eq!(response.status_code(), 200);
     }
+
+    // -----------------------------------------------------------------------
+    // Payload-size limits + failure-after-mutating-stage (#16)
+    // -----------------------------------------------------------------------
+
+    /// A single-call config with an upstream that returns `body`, and the given
+    /// payload caps. `max_*` of `None` omits the key (policy default applies).
+    fn sized_config(
+        max_request: Option<u64>,
+        max_response: Option<u64>,
+        max_result: Option<u64>,
+    ) -> String {
+        let mut cfg = json!({
+            "mcpEndpoint": ENDPOINT,
+            "strictMode": true,
+            "toolName": TOOL_NAME,
+            "toolDescription": "Single call with configurable payload caps.",
+            "toolInputSchema": r#"{"type":"object","properties":{"customerId":{"type":"string"}},"required":["customerId"]}"#,
+            "stages": [
+                { "calls": [
+                    { "name": "createOrder", "endpoint": "https://orders.example.com", "method": "POST", "path": "/orders" }
+                ] }
+            ]
+        });
+        let obj = cfg.as_object_mut().unwrap();
+        if let Some(v) = max_request {
+            obj.insert("maxRequestBytes".into(), json!(v));
+        }
+        if let Some(v) = max_response {
+            obj.insert("maxResponseBytes".into(), json!(v));
+        }
+        if let Some(v) = max_result {
+            obj.insert("maxResultBytes".into(), json!(v));
+        }
+        cfg.to_string()
+    }
+
+    /// Drive a `tools/call` against `config` whose single `orders.example.com`
+    /// call receives a canned upstream response of `upstream_body`.
+    fn call_sized(config: &str, upstream_body: String) -> pdk_unit::UnitHttpResponse {
+        use pdk_unit::{UnitHttpRequest as MockReq, UnitHttpResponse};
+        UnitTestBuilder::default()
+            .with_config(config)
+            .with_http_upstream_from_authority("orders.example.com", move |_req: MockReq| {
+                UnitHttpResponse::new(200).with_body(upstream_body.as_str())
+            })
+            .with_entrypoint(crate::configure)
+            .request(
+                UnitHttpRequest::post()
+                    .with_path(ENDPOINT)
+                    .with_header("content-type", "application/json")
+                    .with_body(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": 40,
+                            "method": "tools/call",
+                            "params": { "name": TOOL_NAME, "arguments": { "customerId": "c1" } }
+                        })
+                        .to_string(),
+                    ),
+            )
+    }
+
+    #[test]
+    fn oversized_request_body_is_rejected_before_parsing() {
+        // maxRequestBytes clamps to a 1 KiB floor; a body well over it is
+        // rejected with a JSON-RPC Invalid Request BEFORE parsing.
+        let cfg = sized_config(Some(1024), None, None);
+        let pad = "x".repeat(4096);
+        let response = tester(&cfg).request(
+            UnitHttpRequest::post()
+                .with_path(ENDPOINT)
+                .with_header("content-type", "application/json")
+                .with_body(
+                    json!({ "jsonrpc": "2.0", "id": 1, "method": "ping", "pad": pad }).to_string(),
+                ),
+        );
+        assert_eq!(response.status_code(), 200);
+        let body = body_json(&response);
+        assert_eq!(body["error"]["code"], -32600);
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("exceeds limit"),
+            "error should name the request-size limit, got {body:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_downstream_response_fails_the_call() {
+        // The downstream returns more than maxResponseBytes → the call fails with
+        // a tool-execution error rather than buffering/parsing it unbounded.
+        let cfg = sized_config(None, Some(1024), None);
+        // A 4 KiB valid-JSON body (a big string value) exceeds the 1 KiB cap.
+        let big_body = json!({ "data": "y".repeat(4096) }).to_string();
+        let response = call_sized(&cfg, big_body);
+        assert_eq!(response.status_code(), 200);
+        let body = body_json(&response);
+        assert_eq!(body["result"]["isError"], true);
+        assert!(
+            body["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("response_too_large"),
+            "expected a response_too_large tool error, got {body:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_final_result_fails_the_call() {
+        // Response is under maxResponseBytes (default 1 MiB) but the serialized
+        // final result exceeds the tiny maxResultBytes → result_too_large.
+        let cfg = sized_config(None, None, Some(1024));
+        let body = json!({ "data": "z".repeat(4096) }).to_string();
+        let response = call_sized(&cfg, body);
+        assert_eq!(response.status_code(), 200);
+        let body = body_json(&response);
+        assert_eq!(body["result"]["isError"], true);
+        assert!(
+            body["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("result_too_large"),
+            "expected a result_too_large tool error, got {body:?}"
+        );
+    }
+
+    #[test]
+    fn within_limits_call_succeeds() {
+        // Control: a small response comfortably under all caps returns isError:false.
+        let cfg = sized_config(Some(1_048_576), Some(1_048_576), Some(1_048_576));
+        let response = call_sized(&cfg, r#"{"ok":true}"#.to_string());
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(body_json(&response)["result"]["isError"], false);
+    }
+
+    /// A two-stage sequential config: stage 1 hits `orders.example.com`
+    /// (the "mutating" call), stage 2 hits `payments.example.com`.
+    fn two_stage_config() -> String {
+        json!({
+            "mcpEndpoint": ENDPOINT,
+            "strictMode": true,
+            "toolName": TOOL_NAME,
+            "toolDescription": "Two sequential stages: create then charge.",
+            "toolInputSchema": r#"{"type":"object","properties":{"customerId":{"type":"string"}},"required":["customerId"]}"#,
+            "pipelineTimeoutMs": 1000,
+            "stages": [
+                { "calls": [
+                    { "name": "createOrder", "endpoint": "https://orders.example.com", "method": "POST", "path": "/orders" }
+                ] },
+                { "calls": [
+                    { "name": "chargePayment", "endpoint": "https://payments.example.com", "method": "POST", "path": "/charge" }
+                ] }
+            ]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn failure_after_earlier_mutating_stage_is_not_rolled_back() {
+        use pdk_unit::{UnitHttpRequest as MockReq, UnitHttpResponse};
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        // Records whether the FIRST (mutating) stage actually fired upstream.
+        let stage1_fired = Rc::new(Cell::new(false));
+        let rec = stage1_fired.clone();
+
+        let response = UnitTestBuilder::default()
+            .with_config(&two_stage_config())
+            .with_http_upstream_from_authority("orders.example.com", move |_req: MockReq| {
+                rec.set(true);
+                UnitHttpResponse::new(200).with_body(r#"{"orderId":"o1"}"#)
+            })
+            // Stage 2 fails: a non-2xx aborts the pipeline (stopOnError defaults true).
+            .with_http_upstream_from_authority("payments.example.com", move |_req: MockReq| {
+                UnitHttpResponse::new(500).with_body(r#"{"error":"declined"}"#)
+            })
+            .with_entrypoint(crate::configure)
+            .request(
+                UnitHttpRequest::post()
+                    .with_path(ENDPOINT)
+                    .with_header("content-type", "application/json")
+                    .with_body(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": 41,
+                            "method": "tools/call",
+                            "params": { "name": TOOL_NAME, "arguments": { "customerId": "c1" } }
+                        })
+                        .to_string(),
+                    ),
+            );
+
+        assert_eq!(response.status_code(), 200);
+        let body = body_json(&response);
+        // The pipeline reports the stage-2 failure as a tool-execution error…
+        assert_eq!(body["result"]["isError"], true);
+        assert!(
+            body["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("http_error"),
+            "expected an http_error tool error from the failing stage, got {body:?}"
+        );
+        // …but stage 1 already committed and is NOT rolled back (documented
+        // no-rollback caveat): its upstream was hit before stage 2 failed.
+        assert!(
+            stage1_fired.get(),
+            "the earlier mutating stage must have already fired (no rollback)"
+        );
+    }
+
+    #[test]
+    fn global_pipeline_deadline_is_enforced() {
+        use pdk_unit::{UnitHttpRequest as MockReq, UnitHttpResponse};
+
+        // pipelineTimeoutMs is clamped to a 1000 ms floor. Make the first stage
+        // consume more than that (real wall-clock, since pdk-unit runs the
+        // entrypoint natively), so the deadline check at the start of stage 2
+        // trips GlobalTimeout deterministically. 1500 ms >> 1000 ms leaves a
+        // comfortable margin against scheduling jitter.
+        let response = UnitTestBuilder::default()
+            .with_config(&two_stage_config())
+            .with_http_upstream_from_authority("orders.example.com", move |_req: MockReq| {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                UnitHttpResponse::new(200).with_body(r#"{"orderId":"o1"}"#)
+            })
+            .with_http_upstream_from_authority("payments.example.com", move |_req: MockReq| {
+                UnitHttpResponse::new(200).with_body(r#"{"ok":true}"#)
+            })
+            .with_entrypoint(crate::configure)
+            .request(
+                UnitHttpRequest::post()
+                    .with_path(ENDPOINT)
+                    .with_header("content-type", "application/json")
+                    .with_body(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": 42,
+                            "method": "tools/call",
+                            "params": { "name": TOOL_NAME, "arguments": { "customerId": "c1" } }
+                        })
+                        .to_string(),
+                    ),
+            );
+
+        assert_eq!(response.status_code(), 200);
+        let body = body_json(&response);
+        assert_eq!(body["result"]["isError"], true);
+        assert!(
+            body["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("deadline"),
+            "expected a global-deadline tool error, got {body:?}"
+        );
+    }
 }
