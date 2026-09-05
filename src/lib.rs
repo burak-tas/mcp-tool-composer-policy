@@ -252,9 +252,13 @@ async fn handle_tools_call(
     let pipeline_args = match dw::eval_transform(raw_config.input_transform.as_ref(), &raw_args) {
         Ok(v) => v,
         Err(e) => {
+            // The DataWeave error `e` can echo the transform's input payload —
+            // keep the detail server-side and return a generic message so
+            // caller input (or credentials in it) never leaks (#13).
+            logger::error!("[{}] inputTransform failed: {}", POLICY_NAME, e);
             return send_json_rpc(
                 200,
-                &tool_error_response(id, format!("inputTransform failed: {e}"), "transform_error"),
+                &tool_error_response(id, "inputTransform failed", "transform_error"),
             );
         }
     };
@@ -337,13 +341,13 @@ async fn handle_tools_call(
     ) {
         Ok(v) => v,
         Err(e) => {
+            // The DataWeave error `e` can echo the composite pipeline output,
+            // which may carry un-masked ${steps.*} credentials — keep the
+            // detail server-side and return a generic message (#13).
+            logger::error!("[{}] outputTransform failed: {}", POLICY_NAME, e);
             return send_json_rpc(
                 200,
-                &tool_error_response(
-                    id,
-                    format!("outputTransform failed: {e}"),
-                    "transform_error",
-                ),
+                &tool_error_response(id, "outputTransform failed", "transform_error"),
             );
         }
     };

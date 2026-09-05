@@ -109,6 +109,29 @@ Supported credential sources:
 
 **`${env.*}` expressions are not supported.** Referencing one is a hard error — the call fails rather than silently sending a request with a hole in it.
 
+### Credential confidentiality
+
+Credentials are marked `security:sensitive` in the policy schema (`token`, `password`,
+`apiKey`, `bodyTemplate`, and each custom header `value`), and the policy treats them as
+confidential end-to-end:
+
+- **Sent upstream, never returned.** A credential is attached to the outbound call's auth
+  header (`Bearer`, `Basic`, the API-key header, or a custom header) but is never copied
+  into the MCP response. If a step *fetches* a token (`${steps.<authCall>}`), set
+  `maskInOutput: true` on that auth call so its value renders as `"***"` in the result
+  while still resolving internally for downstream calls.
+- **Errors are generic.** Transform (`inputTransform`/`outputTransform`) and pipeline
+  failures return a fixed message; the underlying DataWeave/transport detail — which can
+  echo the payload or a resolved credential — is logged server-side only, never sent to
+  the client.
+
+**Passthrough trust boundary.** `authType: passthrough` forwards the incoming MCP request's
+`Authorization` header **verbatim** to the configured upstream. Only use it on calls whose
+`endpoint` you trust with the caller's credential — the gateway is handing that bearer/token
+to the backend as-is. Combine with a JWT/OAuth policy *in front* of this one (see
+[Policy ordering](#policy-ordering)) so the forwarded credential is one you have already
+validated, and never point a passthrough call at an untrusted or third-party host.
+
 ### Expression syntax
 
 - `${args.fieldName}` — value from the (optionally transformed) MCP tool arguments
