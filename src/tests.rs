@@ -467,4 +467,73 @@ mod tests {
             "error should name the unresolved expression, got {text:?}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Full toolInputSchema validation (#12) — types/enums/bounds, not just
+    // `required`, are enforced before the pipeline runs.
+    // -----------------------------------------------------------------------
+
+    /// Config whose schema types + constrains its arguments.
+    fn typed_schema_config() -> String {
+        json!({
+            "mcpEndpoint": ENDPOINT,
+            "strictMode": true,
+            "toolName": TOOL_NAME,
+            "toolDescription": "Typed-argument tool.",
+            "toolInputSchema": r#"{"type":"object","properties":{"customerId":{"type":"string","minLength":1},"quantity":{"type":"integer","minimum":1,"maximum":100},"tier":{"type":"string","enum":["gold","silver"]}},"required":["customerId"],"additionalProperties":false}"#,
+            "stages": [
+                { "calls": [ { "name": "createOrder", "endpoint": "https://orders.example.com", "method": "POST", "path": "/orders" } ] }
+            ]
+        })
+        .to_string()
+    }
+
+    fn call_typed(arguments: Value) -> pdk_unit::UnitHttpResponse {
+        post_rpc(
+            &typed_schema_config(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 40,
+                "method": "tools/call",
+                "params": { "name": TOOL_NAME, "arguments": arguments }
+            }),
+        )
+    }
+
+    #[test]
+    fn schema_rejects_wrong_argument_type() {
+        let response = call_typed(json!({ "customerId": 123 }));
+        assert_eq!(response.status_code(), 200);
+        let body = body_json(&response);
+        assert_eq!(body["error"]["code"], -32602);
+        // Sanitized: names the field + type, never the offending value.
+        let msg = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("customerId"), "got: {msg}");
+        assert!(!msg.contains("123"), "must not echo the value, got: {msg}");
+    }
+
+    #[test]
+    fn schema_rejects_out_of_range_number() {
+        let response = call_typed(json!({ "customerId": "c", "quantity": 999 }));
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(body_json(&response)["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn schema_rejects_value_not_in_enum() {
+        let response = call_typed(json!({ "customerId": "c", "tier": "bronze" }));
+        assert_eq!(response.status_code(), 200);
+        let msg = body_json(&response)["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(msg.contains("tier"), "got: {msg}");
+    }
+
+    #[test]
+    fn schema_rejects_unexpected_argument() {
+        let response = call_typed(json!({ "customerId": "c", "sneaky": true }));
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(body_json(&response)["error"]["code"], -32602);
+    }
 }

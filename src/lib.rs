@@ -10,6 +10,7 @@ mod dw;
 mod generated;
 mod jsonrpc;
 mod pipeline;
+mod schema;
 
 #[cfg(test)]
 mod tests;
@@ -236,9 +237,15 @@ async fn handle_tools_call(
         }
     };
 
-    // Validate required fields declared in toolInputSchema before running any transform.
-    if let Some(err_msg) = validate_args(&raw_args, &policy.tool_input_schema) {
-        return send_json_rpc(200, &error_response(id, INVALID_PARAMS, err_msg));
+    // Validate arguments against the full toolInputSchema (types, enums,
+    // bounds, required, additionalProperties) BEFORE running any transform or
+    // dispatching the pipeline (#12). The error is sanitized — it names the
+    // failing path and constraint, never the offending value.
+    if let Err(err_msg) = schema::validate(&raw_args, &policy.tool_input_schema) {
+        return send_json_rpc(
+            200,
+            &error_response(id, INVALID_PARAMS, format!("invalid arguments — {err_msg}")),
+        );
     }
 
     // 1. Apply inputTransform — reshape args before pipeline.
@@ -349,34 +356,6 @@ async fn handle_tools_call(
         200,
         &success_response(id, json!({ "content": content, "isError": false })),
     )
-}
-
-// ---------------------------------------------------------------------------
-// Argument validation (JSON Schema subset: required array)
-// ---------------------------------------------------------------------------
-
-/// Check `required` fields from the toolInputSchema. Returns `Some(error_message)`
-/// when required fields are missing, `None` when valid.
-fn validate_args(args: &Value, schema: &Value) -> Option<String> {
-    let required = match schema.get("required") {
-        Some(Value::Array(arr)) => arr,
-        _ => return None,
-    };
-
-    let missing: Vec<&str> = required
-        .iter()
-        .filter_map(|v| v.as_str())
-        .filter(|field| args.get(field).is_none())
-        .collect();
-
-    if missing.is_empty() {
-        None
-    } else {
-        Some(format!(
-            "missing required argument(s): {}",
-            missing.join(", ")
-        ))
-    }
 }
 
 // ---------------------------------------------------------------------------
