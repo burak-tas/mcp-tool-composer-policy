@@ -83,7 +83,11 @@ async fn request_filter(
     if !content_type.contains("application/json") {
         return send_json_rpc(
             200,
-            &error_response(None, INVALID_REQUEST, "Content-Type must be application/json"),
+            &error_response(
+                None,
+                INVALID_REQUEST,
+                "Content-Type must be application/json",
+            ),
         );
     }
 
@@ -212,10 +216,7 @@ async fn handle_tools_call(
             &error_response(
                 id,
                 INVALID_PARAMS,
-                format!(
-                    "Unknown tool '{}'. Available: '{}'",
-                    name, policy.tool_name
-                ),
+                format!("Unknown tool '{}'. Available: '{}'", name, policy.tool_name),
             ),
         );
     }
@@ -252,62 +253,75 @@ async fn handle_tools_call(
     };
 
     // 2. Execute pipeline.
-    let pipeline_result = match pipeline::run_pipeline(
-        policy,
-        service_map,
-        &pipeline_args,
-        client,
-        incoming_auth,
-    )
-    .await
-    {
-        Ok(r) => r,
-        // Downstream execution failures → CallToolResult with isError:true so
-        // MCP clients and models can inspect and recover.
-        Err(PipelineError::HttpStatus { call, status }) => {
-            return send_json_rpc(
-                200,
-                &tool_error_response(
-                    id,
-                    format!("call '{}' returned HTTP {}", call, status),
-                    "http_error",
-                ),
-            );
-        }
-        Err(PipelineError::Transport { call, message }) => {
-            logger::error!("[{}] transport error on '{}': {}", POLICY_NAME, call, message);
-            return send_json_rpc(
-                200,
-                &tool_error_response(
-                    id,
-                    format!("call '{}' transport error", call),
-                    "transport_error",
-                ),
-            );
-        }
-        Err(PipelineError::BadJson { call, .. }) => {
-            return send_json_rpc(
-                200,
-                &tool_error_response(
-                    id,
-                    format!("call '{}' returned non-JSON response", call),
-                    "parse_error",
-                ),
-            );
-        }
-        Err(PipelineError::Timeout { call }) => {
-            return send_json_rpc(
-                200,
-                &tool_error_response(id, format!("call '{}' timed out", call), "timeout"),
-            );
-        }
-        Err(PipelineError::GlobalTimeout) => {
-            return send_json_rpc(
-                200,
-                &tool_error_response(id, "pipeline exceeded global deadline", "timeout"),
-            );
-        }
-    };
+    let pipeline_result =
+        match pipeline::run_pipeline(policy, service_map, &pipeline_args, client, incoming_auth)
+            .await
+        {
+            Ok(r) => r,
+            // Downstream execution failures → CallToolResult with isError:true so
+            // MCP clients and models can inspect and recover.
+            Err(PipelineError::HttpStatus { call, status }) => {
+                return send_json_rpc(
+                    200,
+                    &tool_error_response(
+                        id,
+                        format!("call '{}' returned HTTP {}", call, status),
+                        "http_error",
+                    ),
+                );
+            }
+            Err(PipelineError::Transport { call, message }) => {
+                logger::error!(
+                    "[{}] transport error on '{}': {}",
+                    POLICY_NAME,
+                    call,
+                    message
+                );
+                return send_json_rpc(
+                    200,
+                    &tool_error_response(
+                        id,
+                        format!("call '{}' transport error", call),
+                        "transport_error",
+                    ),
+                );
+            }
+            Err(PipelineError::BadJson { call, .. }) => {
+                return send_json_rpc(
+                    200,
+                    &tool_error_response(
+                        id,
+                        format!("call '{}' returned non-JSON response", call),
+                        "parse_error",
+                    ),
+                );
+            }
+            // Injection-safe construction (#11): an unresolved/malformed expression
+            // aborts the call instead of sending a request with a hole in it. The
+            // message carries only the expression text, never a resolved value.
+            Err(PipelineError::Interpolation { call, message }) => {
+                return send_json_rpc(
+                    200,
+                    &tool_error_response(
+                        id,
+                        format!("call '{}' could not be built: {}", call, message),
+                        "invalid_argument",
+                    ),
+                );
+            }
+            Err(PipelineError::Timeout { call }) => {
+                return send_json_rpc(
+                    200,
+                    &tool_error_response(id, format!("call '{}' timed out", call), "timeout"),
+                );
+            }
+            Err(PipelineError::GlobalTimeout) => {
+                return send_json_rpc(
+                    200,
+                    &tool_error_response(id, "pipeline exceeded global deadline", "timeout"),
+                );
+            }
+        };
 
     // 3. Apply outputTransform — shape the composite result for the MCP client.
     let final_value = match dw::eval_transform(
@@ -358,7 +372,10 @@ fn validate_args(args: &Value, schema: &Value) -> Option<String> {
     if missing.is_empty() {
         None
     } else {
-        Some(format!("missing required argument(s): {}", missing.join(", ")))
+        Some(format!(
+            "missing required argument(s): {}",
+            missing.join(", ")
+        ))
     }
 }
 
@@ -436,9 +453,7 @@ pub async fn configure(
         let policy = policy.clone();
         let raw_config = raw_config.clone();
         let service_map = service_map.clone();
-        async move {
-            request_filter(request, policy, raw_config, service_map, client).await
-        }
+        async move { request_filter(request, policy, raw_config, service_map, client).await }
     });
 
     launcher.launch(filter).await?;

@@ -107,7 +107,7 @@ Supported credential sources:
 - **Step-derived** — `${steps.<callName>}` resolves to a value obtained at runtime (e.g. a token from an earlier auth call). Use `maskInOutput: true` on the auth call to hide the token from the MCP result while still forwarding it internally.
 - **Passthrough** — forwards the incoming MCP request's `Authorization` header unchanged.
 
-**`${env.*}` expressions are not supported** and resolve to an empty string. Do not use them.
+**`${env.*}` expressions are not supported.** Referencing one is a hard error — the call fails rather than silently sending a request with a hole in it.
 
 ### Expression syntax
 
@@ -115,6 +115,28 @@ Supported credential sources:
 - `${steps.<callName>}` — full response body of a previous call
 - `${steps.<callName>.field.nested}` — dot-notation path into a previous response
 - `outputExtract: "data.id"` — extract a sub-path from a call's response into `${steps.<name>}`
+
+### Injection-safe construction
+
+Every caller-controlled value is encoded for the exact position it lands in, so a
+malicious MCP argument can only ever be **data**, never request structure:
+
+- **URL (`path`, incl. query string)** — substituted values are percent-encoded
+  (RFC 3986). `path: /v1/search?name=${args.city}&count=1` with `city="Berlin&count=100"`
+  sends `name=Berlin%26count%3D100` — it cannot inject a second query parameter, and
+  a value like `../../admin` cannot traverse the path.
+- **`bodyTemplate` (JSON)** — interpolation is JSON-position aware. A value inside a
+  string (`"${args.customerId}"`) is emitted as escaped string content; a value in a
+  bare position (`${args.quantity}`) is emitted as a complete JSON token. A `"` or `\`
+  in the value cannot break out and inject sibling fields, so the hybrid convention
+  (quote strings, leave numbers/objects bare) stays correct **and** safe.
+- **Headers / credentials** — CR/LF are stripped from substituted values to prevent
+  header injection.
+
+**Strict resolution.** An expression that cannot be resolved — a missing `args`/`steps`
+key, a malformed `${…}`, or an unsupported prefix such as `${env.*}` — fails the call
+with an `isError:true` result naming the offending expression (never the resolved value).
+It is never silently substituted with an empty string.
 
 ## Policy ordering
 

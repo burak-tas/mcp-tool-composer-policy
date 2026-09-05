@@ -302,4 +302,169 @@ mod tests {
         assert_eq!(response.status_code(), 200);
         assert_eq!(body_json(&response)["error"]["code"], -32602);
     }
+
+    // -----------------------------------------------------------------------
+    // Injection-safe construction (#11), end-to-end through the pipeline.
+    //
+    // These dispatch a real `tools/call` to a mocked upstream and assert the
+    // *outbound* request the policy builds — the surface a canned-response mock
+    // would never catch. The mock records the request it received.
+    // -----------------------------------------------------------------------
+
+    /// A config whose single call interpolates caller args into BOTH the URL
+    /// query (`city`) and the JSON body (`customerId`), mirroring the real
+    /// injection sites the issue calls out.
+    fn injection_config() -> String {
+        json!({
+            "mcpEndpoint": ENDPOINT,
+            "strictMode": true,
+            "toolName": TOOL_NAME,
+            "toolDescription": "Composed call that interpolates caller input.",
+            "toolInputSchema": r#"{"type":"object","properties":{"customerId":{"type":"string"},"city":{"type":"string"}},"required":["customerId","city"]}"#,
+            "stages": [
+                {
+                    "calls": [
+                        {
+                            "name": "createOrder",
+                            "endpoint": "https://orders.example.com",
+                            "method": "POST",
+                            "path": "/v1/search?name=${args.city}&count=1",
+                            "bodyTemplate": r#"{"customerId":"${args.customerId}"}"#
+                        }
+                    ]
+                }
+            ]
+        })
+        .to_string()
+    }
+
+    /// Drive a `tools/call` with the given arguments against `injection_config`,
+    /// returning `(outbound_path, outbound_body, mcp_response)`.
+    fn call_with_args(arguments: Value) -> (String, String, pdk_unit::UnitHttpResponse) {
+        use pdk_unit::{UnitHttpMessage, UnitHttpRequest as MockReq, UnitHttpResponse};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let seen: Rc<RefCell<(String, String)>> =
+            Rc::new(RefCell::new((String::new(), String::new())));
+        let recorder = seen.clone();
+
+        let response = UnitTestBuilder::default()
+            .with_config(&injection_config())
+            .with_http_upstream_from_authority("orders.example.com", move |req: MockReq| {
+                // The outbound path is carried in the `:path` pseudo-header.
+                let path = req.header(":path").unwrap_or_default().to_string();
+                let body = String::from_utf8_lossy(req.body()).to_string();
+                *recorder.borrow_mut() = (path, body);
+                UnitHttpResponse::new(200).with_body(r#"{"ok":true}"#)
+            })
+            .with_entrypoint(crate::configure)
+            .request(
+                UnitHttpRequest::post()
+                    .with_path(ENDPOINT)
+                    .with_header("content-type", "application/json")
+                    .with_body(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": 30,
+                            "method": "tools/call",
+                            "params": { "name": TOOL_NAME, "arguments": arguments }
+                        })
+                        .to_string(),
+                    ),
+            );
+
+        let (path, body) = seen.borrow().clone();
+        (path, body, response)
+    }
+
+    #[test]
+    fn query_injection_is_percent_encoded_on_the_wire() {
+        // A `&`/`=`-bearing city must NOT inject a second query parameter.
+        let (path, _body, response) = call_with_args(json!({
+            "customerId": "CU-1",
+            "city": "Berlin&count=100"
+        }));
+        assert_eq!(response.status_code(), 200);
+        assert!(
+            path.contains("name=Berlin%26count%3D100"),
+            "city must be percent-encoded, got path {path:?}"
+        );
+        assert!(
+            !path.contains("name=Berlin&count=100"),
+            "injected raw query param must not reach the wire, got path {path:?}"
+        );
+    }
+
+    #[test]
+    fn body_injection_cannot_add_sibling_fields_on_the_wire() {
+        // A quote-bearing customerId must stay contained in its JSON string.
+        let (_path, body, response) = call_with_args(json!({
+            "customerId": r#"","admin":true,"x":""#,
+            "city": "Berlin"
+        }));
+        assert_eq!(response.status_code(), 200);
+        let parsed: Value = serde_json::from_str(&body).expect("outbound body must be valid JSON");
+        assert_eq!(parsed["customerId"], r#"","admin":true,"x":""#);
+        assert!(
+            parsed.get("admin").is_none(),
+            "caller input must not inject a sibling field, got body {body:?}"
+        );
+    }
+
+    #[test]
+    fn unresolved_reference_fails_the_call_without_dispatching() {
+        // A body template referencing an arg the schema does not require and the
+        // caller omits → the call is rejected (isError:true), not sent with a
+        // hole. `note` is optional here, so it passes arg-validation but fails
+        // interpolation.
+        let cfg = json!({
+            "mcpEndpoint": ENDPOINT,
+            "strictMode": true,
+            "toolName": TOOL_NAME,
+            "toolDescription": "Interpolates an optional, possibly-missing arg.",
+            "toolInputSchema": r#"{"type":"object","properties":{"customerId":{"type":"string"},"note":{"type":"string"}},"required":["customerId"]}"#,
+            "stages": [
+                {
+                    "calls": [
+                        {
+                            "name": "createOrder",
+                            "endpoint": "https://orders.example.com",
+                            "method": "POST",
+                            "path": "/orders",
+                            "bodyTemplate": r#"{"note":"${args.note}"}"#
+                        }
+                    ]
+                }
+            ]
+        })
+        .to_string();
+
+        use pdk_unit::UnitHttpMessage;
+        let response = tester(&cfg).request(
+            UnitHttpRequest::post()
+                .with_path(ENDPOINT)
+                .with_header("content-type", "application/json")
+                .with_body(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 31,
+                        "method": "tools/call",
+                        "params": { "name": TOOL_NAME, "arguments": { "customerId": "CU-1" } }
+                    })
+                    .to_string(),
+                ),
+        );
+        assert_eq!(response.status_code(), 200);
+        let body: Value = serde_json::from_slice(response.body()).unwrap();
+        // CallToolResult with isError:true — the model can see and recover.
+        assert_eq!(body["result"]["isError"], true);
+        let text = body["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            text.contains("args.note"),
+            "error should name the unresolved expression, got {text:?}"
+        );
+    }
 }
