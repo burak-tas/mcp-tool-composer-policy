@@ -79,7 +79,8 @@ mod tests {
         assert_eq!(response.status_code(), 200);
 
         let body = body_json(&response);
-        assert_eq!(body["result"]["protocolVersion"], "2024-11-05");
+        // No requested version → server responds with its preferred (latest).
+        assert_eq!(body["result"]["protocolVersion"], "2025-06-18");
         assert_eq!(body["result"]["serverInfo"]["name"], "mcp-tool-composer");
         assert_eq!(
             body["result"]["capabilities"]["tools"]["listChanged"],
@@ -205,21 +206,31 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn get_with_sse_accept_opens_event_stream() {
+    fn get_with_sse_accept_is_405_not_a_stub_stream() {
         use pdk_unit::UnitHttpMessage;
+        // This server offers no server-initiated SSE stream, so a GET — even one
+        // asking for text/event-stream — is 405 (the spec-sanctioned response),
+        // never a 200 empty event-stream that closes immediately (#14).
         let response = tester(&default_config()).request(
             UnitHttpRequest::get()
                 .with_path(ENDPOINT)
                 .with_header("accept", "text/event-stream"),
         );
-        assert_eq!(response.status_code(), 200);
-        assert_eq!(response.header("content-type"), Some("text/event-stream"));
+        assert_eq!(response.status_code(), 405);
+        assert_eq!(response.header("allow"), Some("POST"));
     }
 
     #[test]
     fn get_without_sse_accept_is_405() {
         let response =
             tester(&default_config()).request(UnitHttpRequest::get().with_path(ENDPOINT));
+        assert_eq!(response.status_code(), 405);
+    }
+
+    #[test]
+    fn delete_is_405() {
+        let response =
+            tester(&default_config()).request(UnitHttpRequest::delete().with_path(ENDPOINT));
         assert_eq!(response.status_code(), 405);
     }
 
@@ -811,5 +822,196 @@ mod tests {
             text.contains("***"),
             "masked step output must render as ***, got {text:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // MCP Streamable-HTTP transport conformance (#14) — protocolVersion
+    // negotiation, the MCP-Protocol-Version header, Accept, and Origin.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn initialize_echoes_a_supported_requested_version() {
+        let response = post_rpc(
+            &default_config(),
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": { "protocolVersion": "2025-03-26" }
+            }),
+        );
+        assert_eq!(response.status_code(), 200);
+        // Supported version → echoed verbatim.
+        assert_eq!(
+            body_json(&response)["result"]["protocolVersion"],
+            "2025-03-26"
+        );
+    }
+
+    #[test]
+    fn initialize_negotiates_down_for_an_unsupported_version() {
+        let response = post_rpc(
+            &default_config(),
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": { "protocolVersion": "1999-01-01" }
+            }),
+        );
+        assert_eq!(response.status_code(), 200);
+        let v = body_json(&response)["result"]["protocolVersion"].clone();
+        // Unsupported → server responds with its preferred version, NOT the
+        // client's requested one.
+        assert_eq!(v, "2025-06-18");
+        assert_ne!(v, "1999-01-01");
+    }
+
+    #[test]
+    fn initialize_is_exempt_from_the_protocol_version_header() {
+        // initialize carries no MCP-Protocol-Version header (the client cannot
+        // know the version yet) — even a bogus one must not turn it into a 400.
+        let response = tester(&default_config()).request(
+            UnitHttpRequest::post()
+                .with_path(ENDPOINT)
+                .with_header("content-type", "application/json")
+                .with_header("mcp-protocol-version", "1999-01-01")
+                .with_body(
+                    json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize" }).to_string(),
+                ),
+        );
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(
+            body_json(&response)["result"]["protocolVersion"],
+            "2025-06-18"
+        );
+    }
+
+    #[test]
+    fn non_initialize_request_without_version_header_falls_back() {
+        // Absent MCP-Protocol-Version → assume the spec default, do NOT 400.
+        let response = post_rpc(
+            &default_config(),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+        );
+        assert_eq!(response.status_code(), 200);
+        assert!(body_json(&response)["result"]["tools"].is_array());
+    }
+
+    #[test]
+    fn non_initialize_request_with_supported_version_header_ok() {
+        let response = tester(&default_config()).request(
+            UnitHttpRequest::post()
+                .with_path(ENDPOINT)
+                .with_header("content-type", "application/json")
+                .with_header("mcp-protocol-version", "2025-06-18")
+                .with_body(
+                    json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }).to_string(),
+                ),
+        );
+        assert_eq!(response.status_code(), 200);
+    }
+
+    #[test]
+    fn non_initialize_request_with_unsupported_version_header_is_400() {
+        let response = tester(&default_config()).request(
+            UnitHttpRequest::post()
+                .with_path(ENDPOINT)
+                .with_header("content-type", "application/json")
+                .with_header("mcp-protocol-version", "1999-01-01")
+                .with_body(
+                    json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }).to_string(),
+                ),
+        );
+        // Spec MUST: an unsupported MCP-Protocol-Version is a 400 Bad Request.
+        assert_eq!(response.status_code(), 400);
+        assert_eq!(body_json(&response)["error"]["code"], -32600);
+    }
+
+    #[test]
+    fn accept_that_excludes_json_is_rejected() {
+        let response = tester(&default_config()).request(
+            UnitHttpRequest::post()
+                .with_path(ENDPOINT)
+                .with_header("content-type", "application/json")
+                .with_header("accept", "text/html")
+                .with_body(json!({ "jsonrpc": "2.0", "id": 3, "method": "ping" }).to_string()),
+        );
+        assert_eq!(response.status_code(), 400);
+        assert_eq!(body_json(&response)["error"]["code"], -32600);
+    }
+
+    #[test]
+    fn accept_with_json_and_event_stream_is_ok() {
+        let response = tester(&default_config()).request(
+            UnitHttpRequest::post()
+                .with_path(ENDPOINT)
+                .with_header("content-type", "application/json")
+                .with_header("accept", "application/json, text/event-stream")
+                .with_body(json!({ "jsonrpc": "2.0", "id": 3, "method": "ping" }).to_string()),
+        );
+        assert_eq!(response.status_code(), 200);
+    }
+
+    #[test]
+    fn accept_wildcard_is_ok() {
+        let response = tester(&default_config()).request(
+            UnitHttpRequest::post()
+                .with_path(ENDPOINT)
+                .with_header("content-type", "application/json")
+                .with_header("accept", "*/*")
+                .with_body(json!({ "jsonrpc": "2.0", "id": 3, "method": "ping" }).to_string()),
+        );
+        assert_eq!(response.status_code(), 200);
+    }
+
+    /// A config identical to `default_config` plus an Origin allowlist.
+    fn origin_restricted_config() -> String {
+        json!({
+            "mcpEndpoint": ENDPOINT,
+            "strictMode": true,
+            "allowedOrigins": ["https://good.example"],
+            "toolName": TOOL_NAME,
+            "toolDescription": "Origin-restricted MCP tool.",
+            "toolInputSchema": r#"{"type":"object","properties":{"customerId":{"type":"string"}},"required":["customerId"]}"#,
+            "stages": [
+                { "calls": [ { "name": "createOrder", "endpoint": "https://orders.example.com", "method": "POST", "path": "/orders" } ] }
+            ]
+        })
+        .to_string()
+    }
+
+    fn ping_with_origin(config: &str, origin: Option<&str>) -> pdk_unit::UnitHttpResponse {
+        let mut req = UnitHttpRequest::post()
+            .with_path(ENDPOINT)
+            .with_header("content-type", "application/json");
+        if let Some(o) = origin {
+            req = req.with_header("origin", o);
+        }
+        req = req.with_body(json!({ "jsonrpc": "2.0", "id": 4, "method": "ping" }).to_string());
+        tester(config).request(req)
+    }
+
+    #[test]
+    fn disallowed_origin_is_403() {
+        let response = ping_with_origin(&origin_restricted_config(), Some("https://evil.example"));
+        assert_eq!(response.status_code(), 403);
+    }
+
+    #[test]
+    fn allowed_origin_passes() {
+        let response = ping_with_origin(&origin_restricted_config(), Some("https://good.example"));
+        assert_eq!(response.status_code(), 200);
+    }
+
+    #[test]
+    fn absent_origin_is_allowed_even_with_allowlist() {
+        // A non-browser client sends no Origin — the rebinding threat is
+        // browser-only, so it must pass.
+        let response = ping_with_origin(&origin_restricted_config(), None);
+        assert_eq!(response.status_code(), 200);
+    }
+
+    #[test]
+    fn no_allowlist_skips_origin_validation() {
+        // default_config has no allowedOrigins → any Origin is accepted.
+        let response = ping_with_origin(&default_config(), Some("https://evil.example"));
+        assert_eq!(response.status_code(), 200);
     }
 }

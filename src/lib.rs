@@ -34,8 +34,64 @@ const POLICY_NAME: &str = "mcp-tool-composer";
 const CONTENT_TYPE_HEADER: &str = "content-type";
 const CONTENT_LENGTH_HEADER: &str = "content-length";
 const APPLICATION_JSON: &str = "application/json";
-// The single MCP protocol version this policy implements (HTTP+SSE transport).
-const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+
+// MCP protocol versions this policy implements, newest first (Streamable-HTTP
+// transport). The first entry is the preferred version returned when
+// negotiation finds no match.
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// Version assumed for a non-`initialize` request that omits the
+/// `MCP-Protocol-Version` header, per the Streamable-HTTP transport spec.
+const DEFAULT_NEGOTIATED_VERSION: &str = "2025-03-26";
+
+/// The preferred (latest) protocol version — returned when the client requests
+/// an unsupported version or none at all.
+fn preferred_protocol_version() -> &'static str {
+    SUPPORTED_PROTOCOL_VERSIONS[0]
+}
+
+fn is_supported_version(version: &str) -> bool {
+    SUPPORTED_PROTOCOL_VERSIONS.contains(&version)
+}
+
+/// Negotiate the response `protocolVersion` for an `initialize` request: echo
+/// the client's requested version when supported, otherwise fall back to the
+/// preferred version (spec: respond with a version the server supports, never
+/// the client's unsupported one).
+fn negotiate_protocol_version(requested: Option<&str>) -> &'static str {
+    match requested {
+        Some(v) => SUPPORTED_PROTOCOL_VERSIONS
+            .iter()
+            .copied()
+            .find(|s| *s == v)
+            .unwrap_or_else(preferred_protocol_version),
+        None => preferred_protocol_version(),
+    }
+}
+
+/// Does an `Accept` header value accept `application/json`? Tokenizes the
+/// comma-separated media ranges, ignores parameters (including `q` weights),
+/// and honors the `*/*` and `application/*` wildcards — so a value like
+/// `application/json-patch+json` never false-matches `application/json`.
+fn accepts_json(accept: &str) -> bool {
+    accept.split(',').any(|range| {
+        let media = range
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        media == "*/*" || media == "application/*" || media == "application/json"
+    })
+}
+
+/// Is `origin` permitted by the configured allowlist? `"*"` allows any origin;
+/// otherwise the match is exact (case-insensitive on the scheme/host).
+fn origin_allowed(origin: &str, allowlist: &[String]) -> bool {
+    allowlist
+        .iter()
+        .any(|allowed| allowed == "*" || allowed.eq_ignore_ascii_case(origin))
+}
 
 // ---------------------------------------------------------------------------
 // Request filter
@@ -59,24 +115,24 @@ async fn request_filter(
         return Flow::Continue(());
     }
 
-    // SSE keep-alive for GET requests.
-    if method == "GET" {
-        let accept = request.handler().header("accept").unwrap_or_default();
-        if accept.contains("text/event-stream") {
-            return send_raw(
-                200,
-                &[
-                    (CONTENT_TYPE_HEADER, "text/event-stream"),
-                    ("cache-control", "no-cache"),
-                ],
-                b"",
-            );
-        }
-        return send_error(405, "Use POST for MCP requests");
+    // Only POST carries MCP JSON-RPC messages. This server returns tool results
+    // synchronously on the POST response and offers no server-initiated SSE
+    // stream, so a GET / DELETE / etc. is 405 Method Not Allowed — the
+    // Streamable-HTTP spec's sanctioned response for a server that does not
+    // offer an SSE channel — never a stub event-stream that closes immediately.
+    if method != "POST" {
+        return method_not_allowed();
     }
 
-    if method != "POST" {
-        return send_error(405, "Use POST for MCP requests");
+    // Origin validation (DNS-rebinding protection). Only enforced when an
+    // allowlist is configured; a request with no Origin header (a non-browser
+    // client) is allowed, since the rebinding threat is browser-only.
+    if !policy.allowed_origins.is_empty() {
+        if let Some(origin) = request.handler().header("origin") {
+            if !origin_allowed(&origin, &policy.allowed_origins) {
+                return send_error(403, "Origin not allowed");
+            }
+        }
     }
 
     // Validate Content-Type for POST — must be application/json.
@@ -92,8 +148,28 @@ async fn request_filter(
         );
     }
 
-    // Capture incoming Authorization header for passthrough auth calls.
+    // Accept, when present, must accept application/json — the only media type
+    // this server emits. An absent Accept is tolerated (many non-browser MCP
+    // clients omit it); a present-but-incompatible Accept is a 400 Bad Request.
+    if let Some(accept) = request.handler().header("accept") {
+        if !accepts_json(&accept) {
+            return send_json_rpc(
+                400,
+                &error_response(
+                    None,
+                    INVALID_REQUEST,
+                    "Accept must include application/json",
+                ),
+            );
+        }
+    }
+
+    // Capture headers needed after the request body is consumed:
+    // - Authorization (forwarded for passthrough auth calls)
+    // - MCP-Protocol-Version (validated post-parse, since `initialize` is exempt)
     let incoming_auth: Option<String> = request.handler().header("authorization");
+    let requested_protocol_version: Option<String> =
+        request.handler().header("mcp-protocol-version");
 
     let body_state = request.into_body_state().await;
     let body = body_state.handler().body();
@@ -127,13 +203,41 @@ async fn request_filter(
         }
     };
 
+    // MCP-Protocol-Version header (Streamable-HTTP): required on every request
+    // AFTER initialization. `initialize` is exempt — the client cannot know the
+    // negotiated version yet. A present-but-unsupported version is a 400 Bad
+    // Request (spec MUST); an absent header falls back to the spec default
+    // (`DEFAULT_NEGOTIATED_VERSION`) rather than erroring.
+    if method_name != "initialize" {
+        match requested_protocol_version.as_deref() {
+            Some(pv) if !is_supported_version(pv) => {
+                return send_json_rpc(
+                    400,
+                    &error_response(
+                        rpc.id.clone(),
+                        INVALID_REQUEST,
+                        format!("unsupported MCP-Protocol-Version '{pv}'"),
+                    ),
+                );
+            }
+            Some(_) => {}
+            None => {
+                logger::debug!(
+                    "[{}] no MCP-Protocol-Version header; assuming {}",
+                    POLICY_NAME,
+                    DEFAULT_NEGOTIATED_VERSION
+                );
+            }
+        }
+    }
+
     // After envelope validation: id-less messages are notifications — 202, empty body.
     if rpc.is_notification() {
         return send_raw(202, &[(CONTENT_TYPE_HEADER, APPLICATION_JSON)], b"");
     }
 
     match method_name.as_str() {
-        "initialize" => handle_initialize(rpc.id),
+        "initialize" => handle_initialize(rpc.id, rpc.params.as_ref()),
 
         "ping" => send_json_rpc(200, &success_response(rpc.id, json!({}))),
 
@@ -171,13 +275,21 @@ async fn request_filter(
 // MCP handlers
 // ---------------------------------------------------------------------------
 
-fn handle_initialize(id: Option<Value>) -> Flow<()> {
+fn handle_initialize(id: Option<Value>, params: Option<&Value>) -> Flow<()> {
+    // Negotiate the protocol version from the client's request: echo it when
+    // supported, otherwise return our preferred (latest) version and let the
+    // client decide whether to disconnect.
+    let requested = params
+        .and_then(|p| p.get("protocolVersion"))
+        .and_then(Value::as_str);
+    let negotiated = negotiate_protocol_version(requested);
+
     send_json_rpc(
         200,
         &success_response(
             id,
             json!({
-                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "protocolVersion": negotiated,
                 "serverInfo": {
                     "name": POLICY_NAME,
                     "version": env!("CARGO_PKG_VERSION"),
@@ -369,6 +481,17 @@ async fn handle_tools_call(
 fn send_json_rpc(status: u32, payload: &JsonRpcOutbound) -> Flow<()> {
     let body = serde_json::to_vec(payload).unwrap_or_default();
     send_raw(status, &[(CONTENT_TYPE_HEADER, APPLICATION_JSON)], &body)
+}
+
+/// 405 Method Not Allowed with an `Allow: POST` header — the Streamable-HTTP
+/// response for any non-POST method, since this server offers no GET SSE
+/// channel or session-termination DELETE.
+fn method_not_allowed() -> Flow<()> {
+    send_raw(
+        405,
+        &[(CONTENT_TYPE_HEADER, APPLICATION_JSON), ("allow", "POST")],
+        br#"{"error":"Use POST for MCP requests"}"#,
+    )
 }
 
 fn send_error(status: u32, detail: &str) -> Flow<()> {

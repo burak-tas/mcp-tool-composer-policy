@@ -29,6 +29,18 @@ spec:
         When true, non-MCP requests are rejected with 404.
         When false, they fall through to the Flex Gateway upstream.
 
+    allowedOrigins:
+      type: array
+      description: >
+        Optional allowlist of HTTP Origin header values permitted to call the
+        MCP endpoint (DNS-rebinding protection, per the MCP Streamable-HTTP
+        transport). When set, a browser request whose Origin is not listed is
+        rejected with 403. Requests without an Origin header (non-browser
+        clients) are always allowed, since the rebinding threat is browser-only.
+        Use "*" to allow any Origin. When empty/unset, Origin is not validated.
+      items:
+        type: string
+
     # ------------------------------------------------------------------
     # The single exposed MCP tool
     # ------------------------------------------------------------------
