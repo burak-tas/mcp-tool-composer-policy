@@ -13,8 +13,17 @@ group_id = "96a7526c-e657-42de-919e-0b7bdfab7a80"
 definition_asset_id = "mcp-tool-composer-policy"
 implementation_asset_id = "mcp-tool-composer-policy-impl"
 
+# This is a *terminating* policy: it answers tools/call itself via Flow::Break.
+# Such a policy must buffer request headers+body atomically (into_headers_body_
+# state) so the synthetic response cannot lose a race to an upstream response —
+# which requires the `enable_stop_iteration` PDK feature (below) and the runtime
+# `flex_enable_stop_iteration` ABI, first available on Flex/Omni Gateway 1.12.0
+# (see #15). Keep this in sync with the minRuntimeVersion pin in the Makefile.
+[package.metadata.flex]
+min-version = "1.12.0"
+
 [dependencies]
-pdk = "1.10.0"
+pdk = { version = "1.10.0", features = ["enable_stop_iteration"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["alloc", "preserve_order"] }
 anyhow = "1.0"

@@ -5,7 +5,12 @@
 //! `futures::future::join_all` — wall-clock cost = slowest call in the stage.
 //!
 //! Auth fix: credential templates (e.g. "${steps.authenticate}") are resolved
-//! through `expr::interpolate` before building auth headers.
+//! through the context-aware `expr` interpolators before building auth headers.
+//!
+//! Injection-safe construction (#11): every caller-derived value is encoded for
+//! its surrounding syntax — URLs are percent-encoded, JSON bodies are built
+//! position-aware, header values are CR/LF-stripped — and an unresolved or
+//! malformed expression is a hard error, never a silent empty string.
 //!
 //! Global deadline: the configured `pipelineTimeoutMs` caps the total wall-clock
 //! duration of all stages combined. Completed stages are NOT rolled back when a
@@ -41,6 +46,16 @@ pub enum PipelineError {
 
     #[error("call '{call}' returned non-JSON body: {message}")]
     BadJson { call: String, message: String },
+
+    #[error("call '{call}' response of {size} bytes exceeded limit of {limit} bytes")]
+    ResponseTooLarge {
+        call: String,
+        size: usize,
+        limit: usize,
+    },
+
+    #[error("call '{call}' could not build request: {message}")]
+    Interpolation { call: String, message: String },
 
     #[error("call '{call}' timed out")]
     Timeout { call: String },
@@ -98,6 +113,7 @@ pub async fn run_pipeline(
                     http_client,
                     effective_timeout_ms as u32,
                     incoming_auth,
+                    config.max_response_bytes,
                 )
                 .await;
                 elapsed_ms += start.elapsed().as_millis() as u64;
@@ -130,8 +146,7 @@ pub async fn run_pipeline(
                 let futures: Vec<_> = calls
                     .iter()
                     .map(|call| {
-                        let service =
-                            services.get(&call.name).expect("service map out of sync");
+                        let service = services.get(&call.name).expect("service map out of sync");
                         let call_timeout_ms =
                             call.timeout_ms.unwrap_or(config.per_request_timeout_ms) as u64;
                         let effective_timeout_ms = call_timeout_ms.min(remaining_ms);
@@ -143,6 +158,7 @@ pub async fn run_pipeline(
                             http_client,
                             effective_timeout_ms as u32,
                             incoming_auth,
+                            config.max_response_bytes,
                         )
                     })
                     .collect();
@@ -208,13 +224,21 @@ async fn execute_call(
     http_client: &HttpClient,
     timeout_ms: u32,
     incoming_auth: Option<&str>,
+    max_response_bytes: usize,
 ) -> Result<Value, PipelineError> {
-    let path = expr::interpolate(&call.path, args, step_outputs);
-    let body_str = call
-        .body_template
-        .as_deref()
-        .map(|t| expr::interpolate(t, args, step_outputs))
-        .unwrap_or_default();
+    // Injection-safe construction (#11): each field is interpolated for its own
+    // syntax, and an unresolved/malformed expression is a hard error rather than
+    // a silent empty string.
+    let interp_err = |e: expr::InterpError| PipelineError::Interpolation {
+        call: call.name.clone(),
+        message: e.to_string(),
+    };
+
+    let path = expr::interpolate_url(&call.path, args, step_outputs).map_err(interp_err)?;
+    let body_str = match call.body_template.as_deref() {
+        Some(t) => expr::interpolate_json_body(t, args, step_outputs).map_err(interp_err)?,
+        None => String::new(),
+    };
 
     let mut headers: Vec<(String, String)> = vec![
         ("content-type".into(), "application/json".into()),
@@ -232,21 +256,24 @@ async fn execute_call(
         AuthConfig::None | AuthConfig::CustomHeaders => {}
         auth => {
             let raw_cred = auth.raw_credential().unwrap_or("");
-            let resolved_cred = expr::interpolate(raw_cred, args, step_outputs);
+            let resolved_cred =
+                expr::interpolate_header(raw_cred, args, step_outputs).map_err(interp_err)?;
             if let Some((k, v)) = auth.auth_header_resolved(&resolved_cred) {
                 headers.push((k, v));
             }
         }
     }
 
-    // Extra / customHeaders — always interpolated.
+    // Extra / customHeaders — always interpolated (CR/LF stripped).
     for (k, v) in &call.extra_headers {
-        let resolved_v = expr::interpolate(v, args, step_outputs);
+        let resolved_v = expr::interpolate_header(v, args, step_outputs).map_err(interp_err)?;
         headers.push((k.clone(), resolved_v));
     }
 
-    let header_refs: Vec<(&str, &str)> =
-        headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let header_refs: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
 
     let timeout = Duration::from_millis(timeout_ms.into());
 
@@ -279,6 +306,17 @@ async fn execute_call(
     }
 
     let body_bytes = response.body();
+
+    // Payload-size cap (#16): a downstream response larger than the configured
+    // limit fails the call rather than being buffered/parsed unbounded.
+    if body_bytes.len() > max_response_bytes {
+        return Err(PipelineError::ResponseTooLarge {
+            call: call.name.clone(),
+            size: body_bytes.len(),
+            limit: max_response_bytes,
+        });
+    }
+
     let json: Value = serde_json::from_slice(body_bytes).map_err(|e| PipelineError::BadJson {
         call: call.name.clone(),
         message: e.to_string(),

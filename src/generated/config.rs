@@ -14,7 +14,10 @@ pub struct Calls0Config {
     pub auth_type: Option<String>,
     #[serde(alias = "bodyTemplate")]
     pub body_template: Option<String>,
-    #[serde(alias = "endpoint", deserialize_with = "pdk::serde::deserialize_service")]
+    #[serde(
+        alias = "endpoint",
+        deserialize_with = "pdk::serde::deserialize_service"
+    )]
     pub endpoint: pdk::hl::Service,
     #[serde(alias = "headerName")]
     pub header_name: Option<String>,
@@ -50,12 +53,20 @@ pub struct Stages0Config {
 }
 #[derive(Deserialize, Clone, Debug)]
 pub struct Config {
+    #[serde(alias = "allowedOrigins")]
+    pub allowed_origins: Option<Vec<String>>,
     #[serde(
         alias = "inputTransform",
         default,
         deserialize_with = "de_input_transform_0"
     )]
     pub input_transform: Option<pdk::script::Script>,
+    #[serde(alias = "maxRequestBytes")]
+    pub max_request_bytes: Option<i64>,
+    #[serde(alias = "maxResponseBytes")]
+    pub max_response_bytes: Option<i64>,
+    #[serde(alias = "maxResultBytes")]
+    pub max_result_bytes: Option<i64>,
     #[serde(alias = "mcpEndpoint")]
     pub mcp_endpoint: Option<String>,
     #[serde(
@@ -81,13 +92,13 @@ pub struct Config {
 }
 #[pdk::hl::entrypoint_flex]
 fn init(abi: &dyn pdk::flex_abi::api::FlexAbi) -> Result<(), anyhow::Error> {
-    let config: Config = serde_json::from_slice(abi.get_configuration())
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "Failed to parse configuration '{}'. Cause: {}",
-                String::from_utf8_lossy(abi.get_configuration()), err
-            )
-        })?;
+    let config: Config = serde_json::from_slice(abi.get_configuration()).map_err(|err| {
+        anyhow::anyhow!(
+            "Failed to parse configuration '{}'. Cause: {}",
+            String::from_utf8_lossy(abi.get_configuration()),
+            err
+        )
+    })?;
     for current in config.stages {
         for current in current.calls {
             abi.service_create(current.endpoint)?;
@@ -96,37 +107,29 @@ fn init(abi: &dyn pdk::flex_abi::api::FlexAbi) -> Result<(), anyhow::Error> {
     abi.setup()?;
     Ok(())
 }
-fn de_input_transform_0<'de, D>(
-    deserializer: D,
-) -> Result<Option<pdk::script::Script>, D::Error>
+fn de_input_transform_0<'de, D>(deserializer: D) -> Result<Option<pdk::script::Script>, D::Error>
 where
     D: serde::de::Deserializer<'de>,
 {
-    let exp: Option<pdk::script::Expression> = serde::de::Deserialize::deserialize(
-        deserializer,
-    )?;
+    let exp: Option<pdk::script::Expression> = serde::de::Deserialize::deserialize(deserializer)?;
     exp.map(|exp| {
-            pdk::script::ScriptingEngine::script(&exp)
-                .input(pdk::script::Input::Payload(pdk::script::Format::Json))
-                .compile()
-                .map_err(serde::de::Error::custom)
-        })
-        .transpose()
+        pdk::script::ScriptingEngine::script(&exp)
+            .input(pdk::script::Input::Payload(pdk::script::Format::Json))
+            .compile()
+            .map_err(serde::de::Error::custom)
+    })
+    .transpose()
 }
-fn de_output_transform_1<'de, D>(
-    deserializer: D,
-) -> Result<Option<pdk::script::Script>, D::Error>
+fn de_output_transform_1<'de, D>(deserializer: D) -> Result<Option<pdk::script::Script>, D::Error>
 where
     D: serde::de::Deserializer<'de>,
 {
-    let exp: Option<pdk::script::Expression> = serde::de::Deserialize::deserialize(
-        deserializer,
-    )?;
+    let exp: Option<pdk::script::Expression> = serde::de::Deserialize::deserialize(deserializer)?;
     exp.map(|exp| {
-            pdk::script::ScriptingEngine::script(&exp)
-                .input(pdk::script::Input::Payload(pdk::script::Format::Json))
-                .compile()
-                .map_err(serde::de::Error::custom)
-        })
-        .transpose()
+        pdk::script::ScriptingEngine::script(&exp)
+            .input(pdk::script::Input::Payload(pdk::script::Format::Json))
+            .compile()
+            .map_err(serde::de::Error::custom)
+    })
+    .transpose()
 }
