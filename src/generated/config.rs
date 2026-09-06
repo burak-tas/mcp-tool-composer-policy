@@ -61,6 +61,12 @@ pub struct Config {
         deserialize_with = "de_input_transform_0"
     )]
     pub input_transform: Option<pdk::script::Script>,
+    #[serde(alias = "maxRequestBytes")]
+    pub max_request_bytes: Option<i64>,
+    #[serde(alias = "maxResponseBytes")]
+    pub max_response_bytes: Option<i64>,
+    #[serde(alias = "maxResultBytes")]
+    pub max_result_bytes: Option<i64>,
     #[serde(alias = "mcpEndpoint")]
     pub mcp_endpoint: Option<String>,
     #[serde(

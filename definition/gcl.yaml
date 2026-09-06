@@ -288,6 +288,40 @@ spec:
         (600 s). Note: completed stages are NOT rolled back on failure — design
         mutating pipelines with idempotency keys or compensating actions.
 
+    # ------------------------------------------------------------------
+    # Payload-size caps
+    # ------------------------------------------------------------------
+    maxRequestBytes:
+      type: integer
+      minimum: 1024
+      maximum: 104857600
+      default: 1048576
+      description: >
+        Maximum size (bytes) of the incoming MCP request body. A larger body is
+        rejected before parsing. Bounds the atomically-buffered request. Default
+        1 MiB, aligned with the Omni downstream connection buffer
+        (FLEX_DOWNSTREAM_CONNECTION_BUFFER_LIMIT_BYTES); raise the env var too if
+        you raise this above 1 MiB, since that buffer is the physical ceiling.
+
+    maxResponseBytes:
+      type: integer
+      minimum: 1024
+      maximum: 104857600
+      default: 1048576
+      description: >
+        Maximum size (bytes) of any single downstream (composed REST call)
+        response body. A larger response fails that call with a tool-execution
+        error instead of being buffered unbounded. Default 1 MiB.
+
+    maxResultBytes:
+      type: integer
+      minimum: 1024
+      maximum: 104857600
+      default: 1048576
+      description: >
+        Maximum size (bytes) of the final serialized MCP tool result. A larger
+        result fails the call with a tool-execution error. Default 1 MiB.
+
   required:
     - toolName
     - toolDescription

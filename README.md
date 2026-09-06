@@ -47,6 +47,9 @@ One policy instance = one MCP tool. To expose multiple composed tools, apply the
 | `mcpEndpoint` | string | | `/mcp` | Path for the MCP endpoint |
 | `strictMode` | boolean | | `true` | Reject non-MCP requests with 404 |
 | `allowedOrigins` | array | | — | Origin allowlist for DNS-rebinding protection; empty/unset = no `Origin` validation (see [Transport compliance](#transport-compliance)) |
+| `maxRequestBytes` | integer | | 1048576 | Max incoming MCP request body size (bytes, 1 KiB–100 MiB); larger is rejected before parsing (see [Payload-size limits](#payload-size-limits)) |
+| `maxResponseBytes` | integer | | 1048576 | Max size of any single downstream response body (bytes); a larger response fails that call |
+| `maxResultBytes` | integer | | 1048576 | Max size of the final serialized MCP result (bytes); a larger result fails the call |
 
 ### Stage configuration
 
@@ -193,6 +196,32 @@ The policy implements the MCP **Streamable-HTTP** transport as the MCP *server*:
 - **Stateless — no session.** The server never issues an `Mcp-Session-Id`; each
   `tools/call` is independent, so clients never need to echo a session header. (Session
   management is optional in the transport for a synchronous request/response server.)
+- **Atomic request buffering (terminating policy).** Because the policy answers
+  `tools/call` itself (`Flow::Break`), it buffers the request headers **and** body in a
+  single transition (`into_headers_body_state`) rather than the sequential
+  headers-then-body pattern. The sequential pattern releases headers to Envoy's router on
+  the first `await`, which starts proxying upstream in parallel — a synthetic response can
+  then lose the race to an upstream one. Atomic buffering holds the request in the filter,
+  so this policy's response always wins. This requires Flex/Omni Gateway ≥ 1.12.0 (see
+  [Prerequisites](#prerequisites)).
+
+## Payload-size limits
+
+Every buffered payload is explicitly bounded so a large body can't drive unbounded work:
+
+- **`maxRequestBytes`** (default 1 MiB) — the incoming MCP request body. A larger body is
+  rejected with a JSON-RPC `Invalid Request` error **before** parsing.
+- **`maxResponseBytes`** (default 1 MiB) — each downstream (composed REST call) response
+  body. A larger response fails that call with a `CallToolResult` tool-execution error
+  (`response_too_large`) instead of being buffered/parsed unbounded.
+- **`maxResultBytes`** (default 1 MiB) — the final serialized MCP result. A larger result
+  fails with a tool-execution error (`result_too_large`).
+
+The atomically-buffered request is *also* physically bounded by the runtime's
+`FLEX_DOWNSTREAM_CONNECTION_BUFFER_LIMIT_BYTES` (default 1 MiB); PDK 1.10+ on Flex/Omni
+≥ 1.12.0 fails an oversized buffered write cleanly rather than panicking. If you raise any
+`max*Bytes` above 1 MiB, raise that env var to match — it is the hard ceiling. Sizes are
+clamped to `[1 KiB, 100 MiB]`.
 
 ## Policy ordering
 
@@ -213,6 +242,7 @@ Apply this policy as the outermost processing layer. Recommended chain:
 - Max 5 calls per parallel stage
 - Max 10 calls total across all stages
 - Global pipeline deadline: configurable via `pipelineTimeoutMs` (default 60 s, max 600 s)
+- Payload sizes: configurable via `maxRequestBytes` / `maxResponseBytes` / `maxResultBytes` (default 1 MiB each; see [Payload-size limits](#payload-size-limits))
 
 ## Known limitations
 
@@ -231,6 +261,13 @@ Apply this policy as the outermost processing layer. Recommended chain:
 - [Rust](https://rustup.rs/) ≥ 1.88
 - [Docker](https://www.docker.com/) (for the Omni Gateway playground)
 - [anypoint-cli-v4](https://docs.mulesoft.com/anypoint-cli/latest/)
+- **Flex / Omni Gateway ≥ 1.12.0** at runtime. This is a *terminating* policy: it
+  buffers the request headers+body atomically (`into_headers_body_state`) so its
+  synthetic response always wins the race against an upstream one. That requires
+  the `flex_enable_stop_iteration` ABI, first shipped in **1.12.0** — earlier
+  runtimes (e.g. 1.9.3) fail the WASM at init. The floor is pinned in
+  `Cargo.toml` (`[package.metadata.flex] min-version`), the generated
+  `minRuntimeVersion`, and the playground image.
 
 ### Build
 
