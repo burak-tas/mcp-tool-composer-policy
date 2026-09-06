@@ -199,6 +199,9 @@ impl Stage {
 pub struct PolicyConfig {
     pub mcp_endpoint: String,
     pub strict_mode: bool,
+    /// Allowlist of permitted HTTP `Origin` header values (DNS-rebinding
+    /// protection). Empty = Origin is not validated. `"*"` allows any origin.
+    pub allowed_origins: Vec<String>,
     pub tool_name: String,
     pub tool_description: String,
     pub tool_input_schema: Value,
@@ -206,6 +209,15 @@ pub struct PolicyConfig {
     pub per_request_timeout_ms: u32,
     /// Global wall-clock cap for the entire pipeline (all stages combined).
     pub pipeline_timeout_ms: u32,
+    /// Maximum size (bytes) of the incoming MCP request body. A larger body is
+    /// rejected before parsing. Bounds the atomically-buffered request (#16).
+    pub max_request_bytes: usize,
+    /// Maximum size (bytes) of any single downstream response body. A larger
+    /// response fails that call with a tool-execution error (#16).
+    pub max_response_bytes: usize,
+    /// Maximum size (bytes) of the final serialized MCP tool result. A larger
+    /// result fails the call with a tool-execution error (#16).
+    pub max_result_bytes: usize,
 }
 
 impl PolicyConfig {
@@ -233,6 +245,17 @@ impl PolicyConfig {
 
         // Global pipeline deadline: default 60 s, max 600 s (same ceiling as per-call).
         let pipeline_timeout_ms = clamp_u32(raw.pipeline_timeout_ms, 1_000, 600_000, 60_000);
+
+        // Payload-size caps (#16). Default 1 MiB each — aligned with the Omni
+        // downstream connection buffer default (FLEX_DOWNSTREAM_CONNECTION_
+        // BUFFER_LIMIT_BYTES), which is the physical ceiling the atomically
+        // buffered request must fit under. Clamped to [1 KiB, 100 MiB]: a value
+        // above the runtime's connection-buffer limit can never actually be
+        // buffered, but we still accept it so operators who raise that env var
+        // are not silently capped lower by the policy.
+        let max_request_bytes = clamp_usize(raw.max_request_bytes, 1_024, 104_857_600, 1_048_576);
+        let max_response_bytes = clamp_usize(raw.max_response_bytes, 1_024, 104_857_600, 1_048_576);
+        let max_result_bytes = clamp_usize(raw.max_result_bytes, 1_024, 104_857_600, 1_048_576);
 
         let mut all_call_names: Vec<String> = Vec::new();
         let mut total_calls: usize = 0;
@@ -326,15 +349,30 @@ impl PolicyConfig {
             stages.push(stage);
         }
 
+        // Normalize the Origin allowlist: trim, drop empties. Empty vec means
+        // "do not validate Origin".
+        let allowed_origins: Vec<String> = raw
+            .allowed_origins
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
         Ok(Self {
             mcp_endpoint: normalize_mcp_path(raw.mcp_endpoint.as_deref().unwrap_or("/mcp")),
             strict_mode: raw.strict_mode.unwrap_or(true),
+            allowed_origins,
             tool_name,
             tool_description: raw.tool_description.clone(),
             tool_input_schema,
             stages,
             per_request_timeout_ms,
             pipeline_timeout_ms,
+            max_request_bytes,
+            max_response_bytes,
+            max_result_bytes,
         })
     }
 
@@ -440,6 +478,10 @@ fn normalize_path(s: &str) -> String {
 
 fn clamp_u32(v: Option<i64>, min: i64, max: i64, default: i64) -> u32 {
     v.unwrap_or(default).clamp(min, max) as u32
+}
+
+fn clamp_usize(v: Option<i64>, min: i64, max: i64, default: i64) -> usize {
+    v.unwrap_or(default).clamp(min, max) as usize
 }
 
 // ---------------------------------------------------------------------------

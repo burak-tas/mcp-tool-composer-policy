@@ -91,7 +91,7 @@ Anypoint Exchange.
 |---|---|
 | `definition_asset_id` changed to table form | `{ name = "mcp-tool-composer-policy", version = "0.1.0" }` — bare string caused `[object Object]-v1-0` failure |
 | `definition/exchange.json` committed | Required at definition root; was only in generated `target/` output |
-| `enable_stop_iteration` removed from runtime `pdk` | Flex 1.9.3 does not support the `flex_enable_stop_iteration` ABI command — WASM failed at init |
+| `enable_stop_iteration` removed from runtime `pdk` | Flex 1.9.3 does not support the `flex_enable_stop_iteration` ABI command — WASM failed at init. **Re-enabled in #15** by targeting Flex/Omni Gateway ≥ 1.12.0 (the first runtime with the ABI); the terminating handler now buffers headers+body atomically via `into_headers_body_state`. |
 | `definition/gcl.yaml` `bindings` map fixed | Invalid YAML map → sequence error in `build-asset-files` (fixed in prior commit) |
 | `.project.yaml` committed | Build runner couldn't locate project root (fixed in prior commit) |
 
@@ -166,5 +166,5 @@ These cases were **not tested before** and confirm new correctness guarantees:
 |---|---|---|
 | L-1 | `outputTransform` with object-literal DataWeave (`#[{...}]`) not supported in Flex 1.9.x | All stage outputs returned in MCP result; filter post-response or wait for PEL update |
 | L-2 | Completed stages are not rolled back on failure | Design mutating pipelines with idempotency keys |
-| L-3 | `enable_stop_iteration` removed from runtime `pdk` for Flex 1.9.3 compatibility | Body-state handlers rely on the flag; future Flex upgrade will re-enable |
+| L-3 | ~~`enable_stop_iteration` removed from runtime `pdk` for Flex 1.9.3 compatibility~~ **Resolved in #15**: re-enabled by targeting Flex/Omni Gateway ≥ 1.12.0 | Runtime floor bumped to 1.12.0 (`minRuntimeVersion`, `[package.metadata.flex] min-version`, playground image); handler buffers atomically via `into_headers_body_state` |
 | L-4 | A2D mock APIs: `auth_enabled` must be `false` for isolated policy testing | Test-only workaround; real backends validate normally |

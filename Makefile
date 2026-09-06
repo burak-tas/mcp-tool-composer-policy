@@ -78,7 +78,7 @@ build-asset-files: $(DEFINITION_SRC_GCL_PATH)
 	fi
 	@cargo anypoint config-gen -p -m $(DEFINITION_SRC_GCL_PATH) -o src/generated/config.rs
 	@for f in target/implementation/metadata.yaml target/implementation-dev/metadata.yaml; do \
-		if [ -f "$$f" ]; then sed -i '' 's/^minRuntimeVersion:.*/minRuntimeVersion: 1.9.3/' "$$f"; fi; \
+		if [ -f "$$f" ]; then sed -i '' 's/^minRuntimeVersion:.*/minRuntimeVersion: 1.12.0/' "$$f"; fi; \
 	done
 
 GROUP_ID                = $(shell cargo anypoint get-group-id)
