@@ -1,7 +1,7 @@
 # Copyright 2026 Salesforce, Inc. All rights reserved.
 [package]
 name = "mcp_tool_composer"
-version = "0.1.0"
+version = "1.0.0"
 rust-version = "1.88.0"
 edition = "2021"
 
