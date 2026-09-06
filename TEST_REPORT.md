@@ -1,170 +1,193 @@
 # Test Report — MCP Tool Composer Policy
 
-**Date:** 2026-09-04 | **Flex Gateway:** 1.9.3 | **Policy:** v0.1.0
-**Backend:** 4 A2D mock REST APIs | **Pipeline:** 3 stages, 4 calls
-**Commit under test:** `2eb4347`
+**Date:** 2026-09-06 | **Flex Gateway:** 1.9.3 / 1.12.1 | **Policy:** v0.1.0
+**Commit under test:** `21b757f` (merged PRs #20–#24)
+**Unit tests:** `cargo test` — **88 / 88 passed** in 1.51 s
+**Integration tests:** curl against live Flex Gateway — **14 / 14 passed**
 
 ---
 
-## Pipeline under test
+## What changed in this revision
+
+| PR | Title | Impact on tests |
+|---|---|---|
+| #20 | CI test harness | 49 new unit tests in `src/tests.rs` |
+| #21 | Security hardening | Credential non-leak tests (#13); injection tests (#11) |
+| #22 | MCP transport compliance (#14) | Protocol-version negotiation, Accept, Origin tests |
+| #23 | Atomic buffering + payload limits (#15/#16) | `enable_stop_iteration` re-enabled (Flex ≥ 1.12.0); payload-size tests |
+| #24 | Docs: transcoding comparison | README only, no test impact |
+
+---
+
+## Unit Tests — `cargo test` (88 / 88)
+
+### Group 1 — MCP method dispatch (src/tests.rs)
+
+| Test | What it verifies | Result |
+|---|---|---|
+| `initialize_returns_protocol_version_and_server_info` | `initialize` → 200, `protocolVersion=2025-06-18`, server name, capabilities | ✅ |
+| `tools_list_exposes_the_single_configured_tool` | `tools/list` → 200, correct tool name + required array | ✅ |
+| `ping_returns_empty_result` | `ping` → 200, `result={}`, no error | ✅ |
+| `known_notification_is_accepted_with_202` | `notifications/initialized` (id-less) → 202, empty body | ✅ |
+| `id_less_message_is_treated_as_notification_after_envelope_validation` | id-less valid envelope → 202, never method-not-found | ✅ |
+| `unknown_method_is_method_not_found` | `resources/list` → 200, code `-32601` | ✅ |
+
+### Group 2 — JSON-RPC envelope validation
+
+| Test | What it verifies | Result |
+|---|---|---|
+| `malformed_json_body_is_a_parse_error` | `{ not valid json` → code `-32700` | ✅ |
+| `wrong_jsonrpc_version_is_invalid_request` | `jsonrpc:"1.0"` → code `-32600` | ✅ |
+| `missing_method_is_invalid_request` | body with no `method` field → code `-32600` | ✅ |
+
+### Group 3 — Transport guards
+
+| Test | What it verifies | Result |
+|---|---|---|
+| `get_with_sse_accept_is_405_not_a_stub_stream` | GET with `Accept: text/event-stream` → 405, `Allow: POST` header | ✅ |
+| `get_without_sse_accept_is_405` | plain GET → 405 | ✅ |
+| `delete_is_405` | DELETE → 405 | ✅ |
+| `post_with_wrong_content_type_is_invalid_request` | `Content-Type: text/plain` → code `-32600` | ✅ |
+| `non_mcp_path_is_404_in_strict_mode` | POST to `/not-mcp` with `strictMode:true` → 404 | ✅ |
+
+### Group 4 — tools/call argument validation
+
+| Test | What it verifies | Result |
+|---|---|---|
+| `tools_call_unknown_tool_name_is_invalid_params` | unknown tool name → code `-32602` | ✅ |
+| `tools_call_missing_required_argument_is_invalid_params` | missing `customerId` → code `-32602`, field named in message | ✅ |
+| `tools_call_non_object_arguments_is_invalid_params` | `arguments:"not-an-object"` → code `-32602` | ✅ |
+
+### Group 5 — Injection safety (#11)
+
+| Test | What it verifies | Result |
+|---|---|---|
+| `query_injection_is_percent_encoded_on_the_wire` | `city="Berlin&count=100"` → percent-encoded `Berlin%26count%3D100` on wire | ✅ |
+| `body_injection_cannot_add_sibling_fields_on_the_wire` | quote-bearing `customerId` → stays in JSON string, no injected sibling key | ✅ |
+| `unresolved_reference_fails_the_call_without_dispatching` | optional arg missing → `isError:true` + expression named, no upstream call | ✅ |
+
+### Group 6 — Full toolInputSchema validation (#12)
+
+| Test | What it verifies | Result |
+|---|---|---|
+| `schema_rejects_wrong_argument_type` | `customerId:123` (integer) → code `-32602`, field named, value NOT echoed | ✅ |
+| `schema_rejects_out_of_range_number` | `quantity:999` (> max 100) → code `-32602` | ✅ |
+| `schema_rejects_value_not_in_enum` | `tier:"bronze"` (not in `["gold","silver"]`) → code `-32602`, field named | ✅ |
+| `schema_rejects_unexpected_argument` | `sneaky:true` with `additionalProperties:false` → code `-32602` | ✅ |
+
+### Group 7 — Credential handling (#13)
+
+| Test | What it verifies | Result |
+|---|---|---|
+| `static_bearer_token_is_sent_upstream_but_never_returned` | `Authorization: Bearer S3CRET-BEARER` reaches upstream; absent from response | ✅ |
+| `basic_auth_password_is_encoded_upstream_and_never_returned` | plaintext password never on wire (Base64-encoded); absent from response | ✅ |
+| `api_key_header_is_sent_upstream_but_never_returned` | `X-Api-Key: S3CRET-KEY` reaches upstream; absent from response | ✅ |
+| `custom_header_credential_is_sent_upstream_but_never_returned` | custom auth header reaches upstream; absent from response | ✅ |
+| `passthrough_forwards_incoming_authorization_but_never_returns_it` | inbound `Authorization` forwarded unchanged; not echoed in response | ✅ |
+| `masked_step_derived_credential_is_not_echoed_in_response` | token from Stage 1 reaches Stage 2 upstream as `Bearer`; response shows `***` | ✅ |
+
+### Group 8 — MCP Streamable-HTTP transport conformance (#14)
+
+| Test | What it verifies | Result |
+|---|---|---|
+| `initialize_echoes_a_supported_requested_version` | `protocolVersion:"2025-03-26"` requested → echoed verbatim | ✅ |
+| `initialize_negotiates_down_for_an_unsupported_version` | `protocolVersion:"1999-01-01"` → server replies `2025-06-18` | ✅ |
+| `initialize_is_exempt_from_the_protocol_version_header` | bogus `MCP-Protocol-Version` header on initialize → still 200 | ✅ |
+| `non_initialize_request_without_version_header_falls_back` | absent header → spec default assumed, no 400 | ✅ |
+| `non_initialize_request_with_supported_version_header_ok` | `MCP-Protocol-Version: 2025-06-18` → 200 | ✅ |
+| `non_initialize_request_with_unsupported_version_header_is_400` | `MCP-Protocol-Version: 1999-01-01` → 400, code `-32600` | ✅ |
+| `accept_that_excludes_json_is_rejected` | `Accept: text/html` → 400, code `-32600` | ✅ |
+| `accept_with_json_and_event_stream_is_ok` | `Accept: application/json, text/event-stream` → 200 | ✅ |
+| `accept_wildcard_is_ok` | `Accept: */*` → 200 | ✅ |
+| `disallowed_origin_is_403` | `Origin: https://evil.example` with allowlist → 403 | ✅ |
+| `allowed_origin_passes` | `Origin: https://good.example` in allowlist → 200 | ✅ |
+| `absent_origin_is_allowed_even_with_allowlist` | no Origin header → 200 (non-browser clients not blocked) | ✅ |
+| `no_allowlist_skips_origin_validation` | no `allowedOrigins` config → any Origin passes | ✅ |
+
+### Group 9 — Payload-size limits + no-rollback (#15/#16)
+
+| Test | What it verifies | Result |
+|---|---|---|
+| `oversized_request_body_is_rejected_before_parsing` | body > `maxRequestBytes` → code `-32600` "exceeds limit", before parse | ✅ |
+| `oversized_downstream_response_fails_the_call` | upstream response > `maxResponseBytes` → `isError:true`, `response_too_large` | ✅ |
+| `oversized_final_result_fails_the_call` | result > `maxResultBytes` → `isError:true`, `result_too_large` | ✅ |
+| `within_limits_call_succeeds` | all caps generous → `isError:false` | ✅ |
+| `failure_after_earlier_mutating_stage_is_not_rolled_back` | stage 2 fails → `isError:true`; stage 1 already fired (no rollback) | ✅ |
+| `global_pipeline_deadline_is_enforced` | stage 1 sleeps 1500 ms > `pipelineTimeoutMs:1000` → `isError:true`, "deadline" | ✅ |
+
+### Schema unit tests (src/schema.rs — 39 tests)
+
+All 39 tests from the JSON Schema validator pass (type checking, enum, bounds, `additionalProperties`, `required`, nested objects, `minLength`/`maxLength`, sanitized error messages that name fields but never echo user values).
+
+---
+
+## Integration Tests — Live Flex Gateway (14 / 14)
+
+**Endpoint:** `https://mg-root-small-okoqaf.2wag5p.usa-e2.cloudhub.io/mcptoolcomp/mcp`
+**Policy version deployed:** `0.1.0-20260906061959` (from commit `21b757f`)
+
+### Pipeline under test (createOrder)
 
 ```
-Stage 1 (sequential)   Auth Service    → none auth      → extracts access_token (maskInOutput: true)
-Stage 2 (parallel)     Customer API    → Bearer token   → returns customer profile
-                       Inventory API   → X-API-Key      → returns stock level
+Stage 1 (sequential)   Auth Service    → none auth      → access_token (maskInOutput: true)
+Stage 2 (parallel)     Customer API    → Bearer token   → customer profile
+                       Inventory API   → X-API-Key      → stock level
 Stage 3 (sequential)   Orders API      → Basic auth     → creates order
 ```
 
----
-
-## TC-02 — Happy Path (all stages successful, token masked)
-
-| Stage | Call | Auth Type | Response |
-|---|---|---|---|
-| Stage 1 | `getToken` | `none` | `***` ✅ (masked — token used internally for Stage 2) |
-| Stage 2 | `fetchCustomer` | `bearerToken` → `Authorization: Bearer <token>` | `{ id: CUST-001, name: Acme Corp, tier: enterprise, creditLimit: 50000 }` ✅ |
-| Stage 2 | `checkInventory` | `apiKeyHeader` → `X-API-Key: inv-api-key-mcp-composer-2026` | `{ sku: SKU-7842, name: Industrial Sensor v3, stockLevel: 142, available: true }` ✅ |
-| Stage 3 | `createOrder` | `basicAuth` → `Authorization: Basic b3JkZXJzLXN2Yz…` | `{ orderId: ORD-…, status: confirmed }` ✅ |
-
----
-
-## TC-07 — Happy Path with out-of-stock SKU (`stopOnError: false`, token masked)
-
-| Stage | Call | Auth Type | Response |
-|---|---|---|---|
-| Stage 1 | `getToken` | `none` | `***` ✅ (masked) |
-| Stage 2 | `fetchCustomer` | `bearerToken` | `{ id: CUST-001, name: Acme Corp, tier: enterprise }` ✅ |
-| Stage 2 | `checkInventory` | `apiKeyHeader` | `{ sku: SKU-0000, available: false }` ⚠️ continues |
-| Stage 3 | `createOrder` | `basicAuth` | `{ status: confirmed }` ✅ |
-
-> `stopOnError: false` — out-of-stock did not abort the pipeline.
-
----
-
-## TC-11 — Token masking does not break downstream propagation
-
-| Check | Result |
-|---|---|
-| `getToken` value in MCP response | `***` ✅ |
-| `fetchCustomer` call succeeded (token forwarded in `Authorization` header) | `true` ✅ |
-| Customer name returned | `Acme Corp` ✅ |
-| Order status | `confirmed` ✅ |
-
----
-
-## All Test Cases
+### Results
 
 | # | Description | Expected | Actual | Result |
 |---|---|---|---|---|
-| TC-01 | `tools/list` | Tool `createOrder` with full input schema and `required: [customerId, productSku, quantity]` | Correct schema returned, required array present | ✅ PASS |
-| TC-02 | **Happy path** — CUST-001 + SKU-7842, qty 5 | All 3 stages complete, `isError: false`, token masked | All 4 calls succeeded, `getToken: "***"`, `isError: false` | ✅ PASS |
-| TC-03 | Unknown tool name | JSON-RPC `-32602` with available tools listed | `"Unknown tool 'deleteEverything'. Available: 'createOrder'"` | ✅ PASS |
-| TC-04 | Missing `customerId` argument | JSON-RPC `-32602` **before any network call** (schema validation) | `"missing required argument(s): customerId"` — no outbound request made | ✅ PASS |
-| TC-05 | Unknown customer (CUST-999) | `isError: true` with HTTP 404 detail | `[http_error] call 'fetchCustomer' returned HTTP 404`, `isError: true` | ✅ PASS |
-| TC-06 | Non-MCP path with `strictMode: true` | HTTP 404 | HTTP 404 | ✅ PASS |
-| TC-07 | **Happy path** — out-of-stock SKU, `stopOnError: false` | Inventory returns `available: false`, pipeline continues, token masked | Order confirmed, `checkInventory.available: false`, `getToken: "***"` | ✅ PASS |
-| TC-08 | Malformed JSON body | JSON-RPC `-32700 Parse error` | `"Parse error: key must be a string at line 1 column 2"` | ✅ PASS |
-| TC-09 | Unsupported method (`resources/list`) | JSON-RPC `-32601 Method not found` | `"Method not supported: resources/list"` | ✅ PASS |
-| TC-10 | GET request without SSE Accept header | HTTP 405 | HTTP 405 | ✅ PASS |
-| TC-11 | **Token masking** — `maskInOutput: true` output redacted, pipeline propagates internally | `getToken: "***"` in response, `fetchCustomer` still succeeds | Token masked, downstream Bearer call succeeded, order confirmed | ✅ PASS |
-| TC-12 | **P4A → Anypoint deploy** — `make build-asset-files` + publish to Exchange | Build pipeline completes, policy published to Anypoint Exchange | Definition + implementation published; version `0.1.0-20260904191722` | ✅ PASS |
-| TC-13 | Wrong `Content-Type` (not `application/json`) | JSON-RPC `-32600 Invalid Request` | `"Content-Type must be application/json"` | ✅ PASS |
-| TC-14 | `arguments` field not an object | JSON-RPC `-32602 Invalid Params` | `"'arguments' must be a JSON object, got \"bad\""` | ✅ PASS |
-
-**Functional: 13 / 13 PASS | Deploy: 1 / 1 PASS — 14 / 14 total**
+| TC-01 | `tools/list` | Tool `createOrder`, `required: [customerId, productSku, quantity]` | Correct schema returned | ✅ PASS |
+| TC-02 | Happy path — CUST-001 + SKU-7842, qty 5 | All stages complete, `isError:false`, token masked | `getToken:"***"`, order confirmed | ✅ PASS |
+| TC-03 | Unknown tool name | `-32602` with available tools listed | `"Unknown tool 'deleteEverything'"` | ✅ PASS |
+| TC-04 | Missing `customerId` | `-32602` **before any network call** | `"missing required argument(s): customerId"` | ✅ PASS |
+| TC-05 | Unknown customer (CUST-999) | `isError:true`, HTTP 404 detail | `[http_error] call 'fetchCustomer' returned HTTP 404` | ✅ PASS |
+| TC-06 | Non-MCP path, `strictMode:true` | HTTP 404 | HTTP 404 | ✅ PASS |
+| TC-07 | Out-of-stock SKU, `stopOnError:false` | Pipeline continues, token masked | Order confirmed, `available:false`, `getToken:"***"` | ✅ PASS |
+| TC-08 | Malformed JSON body | `-32700 Parse error` | `"Parse error: key must be a string…"` | ✅ PASS |
+| TC-09 | Unsupported method (`resources/list`) | `-32601 Method not found` | `"Method not supported: resources/list"` | ✅ PASS |
+| TC-10 | GET without SSE Accept | HTTP 405 | HTTP 405 | ✅ PASS |
+| TC-11 | `maskInOutput:true` — token masked, pipeline propagates | `getToken:"***"`, downstream call succeeds | Token masked, Bearer call succeeded, order confirmed | ✅ PASS |
+| TC-12 | P4A → Anypoint deploy | Build pipeline + publish to Exchange | Published `0.1.0-20260906061959` ✅ | ✅ PASS |
+| TC-13 | Wrong `Content-Type` | `-32600 Invalid Request` | `"Content-Type must be application/json"` | ✅ PASS |
+| TC-14 | `arguments` not an object | `-32602 Invalid Params` | `"'arguments' must be a JSON object"` | ✅ PASS |
 
 ---
 
-## TC-12 — P4A → Anypoint Platform Deploy
+## Behaviour changes since previous report
 
-### What is tested
-
-The P4A build pipeline clones the GitHub repo at the latest commit (`2eb4347`),
-runs `make build-asset-files` (which calls `anypoint-cli-v4 pdk policy-project build-asset-files`
-to regenerate `src/generated/config.rs` from `definition/gcl.yaml`), compiles the Rust
-crate to `wasm32-wasip1`, and publishes the definition + implementation assets to
-Anypoint Exchange.
-
-### Pre-deploy fixes in this commit
-
-| Fix | Detail |
-|---|---|
-| `definition_asset_id` changed to table form | `{ name = "mcp-tool-composer-policy", version = "0.1.0" }` — bare string caused `[object Object]-v1-0` failure |
-| `definition/exchange.json` committed | Required at definition root; was only in generated `target/` output |
-| `enable_stop_iteration` removed from runtime `pdk` | Flex 1.9.3 does not support the `flex_enable_stop_iteration` ABI command — WASM failed at init. **Re-enabled in #15** by targeting Flex/Omni Gateway ≥ 1.12.0 (the first runtime with the ABI); the terminating handler now buffers headers+body atomically via `into_headers_body_state`. |
-| `definition/gcl.yaml` `bindings` map fixed | Invalid YAML map → sequence error in `build-asset-files` (fixed in prior commit) |
-| `.project.yaml` committed | Build runner couldn't locate project root (fixed in prior commit) |
-
-### Result — ✅ PASS
-
-**Ran manually via `anypoint-cli-v4 pdk policy-project publish` on 2026-09-04.**
-
-Additional fix found during manual run: `definition_asset_id` in Cargo.toml must be a **plain string** (not a TOML table) — `anypoint-cli-v4` (Node.js) reads the TOML table as `[object Object]`, producing invalid asset IDs. `cargo-anypoint` (Rust) handles both forms. Reverted to string form.
-
-| Step | Command | Outcome |
+| Area | Before (`2eb4347`) | After (`21b757f`) |
 |---|---|---|
-| 1. Regenerate asset files | `make build-asset-files` | All 6 artifacts generated ✅ |
-| 2. Compile WASM | `cargo build --target wasm32-wasip1 --release` | `mcp_tool_composer.wasm` (release) ✅ |
-| 3. Generate impl GCL | `cargo-anypoint gcl-gen -d mcp-tool-composer-policy -n default ...` | `mcp_tool_composer_implementation.yaml` ✅ |
-| 4. Publish definition | `anypoint-cli-v4 pdk policy-project publish` | Published to Exchange ✅ |
-| 5. Publish implementation | (same command, continues automatically) | Published to Exchange ✅ |
-
-**Exchange asset IDs published:**
-- Definition: `mcp-tool-composer-policy-dev` v`0.1.0-20260904191722`
-- Implementation: `mcp-tool-composer-policy-impl-dev` v`0.1.0-20260904191722`
-- Exchange URL: `https://anypoint.mulesoft.com/exchange/96a7526c-e657-42de-919e-0b7bdfab7a80/mcp-tool-composer-policy-dev`
-
----
-
-## Auth Coverage
-
-| API | Auth Type | How credentials are sent | Verified |
-|---|---|---|---|
-| Auth Service | `none` | No auth — `client_id` in body | ✓ Token extracted via `outputExtract: access_token` |
-| Customer API | `bearerToken` | `Authorization: Bearer ${steps.getToken}` | ✓ Token propagated from Stage 1 (masked in output) |
-| Inventory API | `apiKeyHeader` | `X-API-Key: inv-api-key-mcp-composer-2026` | ✓ Static key set correctly |
-| Orders API | `basicAuth` | `Authorization: Basic <base64(orders-svc:s3cr3t-mcp-2026)>` | ✓ Base64 encoding correct |
+| Protocol version | Fixed `2024-11-05` | Negotiated — echoes client's version if supported, else `2025-06-18` |
+| `MCP-Protocol-Version` header | Ignored | Validated on non-initialize requests; unsupported → 400 |
+| `Accept` header | Ignored | `text/html`-only → 400; `*/*` and `application/json` → pass |
+| Origin validation | Not supported | `allowedOrigins` config; disallowed → 403; absent Origin always passes |
+| GET + SSE Accept | Returns 200 empty event-stream | Returns 405 with `Allow: POST` (spec-correct) |
+| Input schema validation | `required` array only | Full JSON Schema: types, enums, bounds, `additionalProperties` |
+| Injection safety | No encoding | Query params percent-encoded; body template values JSON-escaped |
+| Payload size limits | Unbounded | `maxRequestBytes`, `maxResponseBytes`, `maxResultBytes` — all enforced |
+| Unresolved `${args.*}` | Sent as literal string `"${args.x}"` | `isError:true` before dispatch, expression named in error |
+| Atomic buffering | Race possible on early response | `enable_stop_iteration` (Flex ≥ 1.12.0) — headers+body buffered atomically |
 
 ---
 
-## Behaviour Changes Since Previous Report (issue-fix round)
+## Exchange Assets (current)
 
-These cases were **not tested before** and confirm new correctness guarantees:
-
-| Behaviour | Before | After |
+| Asset ID | Version | Type |
 |---|---|---|
-| Schema validation (TC-04) | Missing args caused 404 from backend | `-32602` returned immediately, no network call |
-| Pipeline failures (TC-05) | `-32603 Internal Error` JSON-RPC error | `isError: true` in `CallToolResult` (MCP-compliant) |
-| Success response | No `isError` field | `isError: false` always present on success |
-| Content-Type enforcement (TC-13) | Accepted any Content-Type | `-32600` if not `application/json` |
-| Arguments type check (TC-14) | Non-object arguments silently became `{}` | `-32602` with type detail |
-| DataWeave binding | `bind_vars("payload", …)` → potential panic | `bind_payload(&str)` — correct PDK API, returns `Result` |
-
----
-
-## `maskInOutput` Feature
-
-```yaml
-- name: getToken
-  endpoint: https://auth.example.com
-  method: POST
-  path: /token
-  authType: none
-  outputExtract: access_token
-  maskInOutput: true   # ← token replaced with "***" in MCP response
-```
-
-- Real value flows internally through `step_outputs`; `${steps.getToken}` resolves normally.
-- Only the final MCP response is redacted.
-- Default: `false`.
+| `mcp-tool-composer-policy-dev` | `0.1.0-20260906061959` | Definition |
+| `mcp-tool-composer-policy-impl-dev` | `0.1.0-20260906061959` | Implementation |
 
 ---
 
 ## Known Limitations
 
-| # | Issue | Impact |
-|---|---|---|
-| L-1 | `outputTransform` with object-literal DataWeave (`#[{...}]`) not supported in Flex 1.9.x | All stage outputs returned in MCP result; filter post-response or wait for PEL update |
-| L-2 | Completed stages are not rolled back on failure | Design mutating pipelines with idempotency keys |
-| L-3 | ~~`enable_stop_iteration` removed from runtime `pdk` for Flex 1.9.3 compatibility~~ **Resolved in #15**: re-enabled by targeting Flex/Omni Gateway ≥ 1.12.0 | Runtime floor bumped to 1.12.0 (`minRuntimeVersion`, `[package.metadata.flex] min-version`, playground image); handler buffers atomically via `into_headers_body_state` |
-| L-4 | A2D mock APIs: `auth_enabled` must be `false` for isolated policy testing | Test-only workaround; real backends validate normally |
+| # | Limitation |
+|---|---|
+| L-1 | `outputTransform` / `inputTransform` DataWeave not supported on Flex 1.9.x (dw2pel restriction) — omit in production configs |
+| L-2 | Completed stages are **not rolled back** on failure — design mutating pipelines with idempotency keys |
+| L-3 | `enable_stop_iteration` requires Flex / Omni Gateway ≥ 1.12.0 — do not deploy to earlier runtimes |
+| L-4 | One policy instance = one MCP tool; apply multiple times for multiple tools |
+| L-5 | Output is text-only (`content[0].type:"text"`); `structuredContent` not supported |
